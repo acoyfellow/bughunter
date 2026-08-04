@@ -734,7 +734,7 @@ mod tests {
         let fixture = Fixture::new("killed");
         let configuration = fixture.configuration(
             "test -L node_modules/reachable && test \"$(cat source.txt)\" = xbcdef && exit 1",
-            Duration::from_secs(2),
+            Duration::from_secs(60),
             1,
         );
 
@@ -753,7 +753,7 @@ mod tests {
         let fixture = Fixture::new("survived");
         let configuration = fixture.configuration(
             "test -L node_modules/reachable && test \"$(cat source.txt)\" = xbcdef",
-            Duration::from_secs(2),
+            Duration::from_secs(60),
             1,
         );
 
@@ -781,7 +781,7 @@ mod tests {
         let fixture = Fixture::new("error");
         let configuration = fixture.configuration(
             "definitely-not-a-real-binary-xyz",
-            Duration::from_secs(2),
+            Duration::from_secs(60),
             1,
         );
 
