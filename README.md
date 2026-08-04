@@ -80,8 +80,23 @@ bughunter run --repo <DIR> --file <RELATIVE.ts> --operators <IDS> --test <CMD> -
 | `--timeout-ms N` | per-mutant timeout, default 30000 |
 | `--concurrency N` | mutants in flight, default 4 |
 | `--skip-baseline` | do not verify the suite passes before mutating |
-| `--fail-on-survivors` | exit 2 when one or more mutants survived; useful for CI gates |
+| `--fail-on-survivors` | gate CI: exit 2 on survivors, exit 3 on unevaluated mutants |
 | `--version` | print the installed bughunter version |
+
+### Exit codes
+
+| code | meaning |
+|---|---|
+| `0` | the run completed and no selected gate failed |
+| `1` | a usage, parse, or baseline error occurred |
+| `2` | `--fail-on-survivors` found surviving mutants; takes precedence over `3` |
+| `3` | `--fail-on-survivors` found only timed-out or errored mutants |
+
+Exit `3` matters more than it looks. If every mutant fails to run because a port was bound, the disk
+filled, or the machine ran out of memory, there are zero survivors — and a gate that only checked for
+survivors would report a green build having tested nothing at all. Unevaluated mutants are missing
+data, so they fail the gate separately rather than passing it silently. Survivors win the exit code
+when both are present, because a survivor is the more actionable finding.
 
 ### Operators
 
@@ -114,9 +129,15 @@ Eight, each a single-token change:
 bughunter does not provide isolation. The `--test` argument is executed with `sh -c`, so it can run
 arbitrary shell commands.
 
-For every mutant, bughunter copies the repository into a world-readable temporary directory under
-`/tmp`, preserving the original file permissions. Secrets in the repository, including `.env`,
-`.dev.vars`, credentials, and tokens, are copied there in cleartext.
+For every mutant, bughunter copies the repository into a temporary directory, preserving the original
+file permissions. Secrets in the repository, including `.env`, `.dev.vars`, credentials, and tokens,
+are copied there in cleartext.
+
+That copy is created under `$TMPDIR` when set, falling back to the system temporary directory. Each
+run directory is created fresh with mode `0700`, so it is owner-only rather than world-readable, and
+bughunter refuses to reuse a directory that already exists instead of writing into it. On a shared
+host this matters: a fixed, predictable path can be pre-created by another user, who would then be
+handed your cleartext secrets.
 
 Dependency directories are symlinked to the originals, so a test command can still write to your
 real `node_modules`. Mutants run your real test suite with your real environment.
