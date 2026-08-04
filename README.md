@@ -80,6 +80,8 @@ bughunter run --repo <DIR> --file <RELATIVE.ts> --operators <IDS> --test <CMD> -
 | `--timeout-ms N` | per-mutant timeout, default 30000 |
 | `--concurrency N` | mutants in flight, default 4 |
 | `--skip-baseline` | do not verify the suite passes before mutating |
+| `--fail-on-survivors` | exit 2 when one or more mutants survived; useful for CI gates |
+| `--version` | print the installed bughunter version |
 
 ### Operators
 
@@ -106,6 +108,20 @@ Eight, each a single-token change:
 | `error` | the mutant could not be evaluated |
 
 `timeout` and `error` are never counted as `killed`. A hung suite is an unknown, not a success.
+
+## Security and trust model
+
+bughunter does not provide isolation. The `--test` argument is executed with `sh -c`, so it can run
+arbitrary shell commands.
+
+For every mutant, bughunter copies the repository into a world-readable temporary directory under
+`/tmp`, preserving the original file permissions. Secrets in the repository, including `.env`,
+`.dev.vars`, credentials, and tokens, are copied there in cleartext.
+
+Dependency directories are symlinked to the originals, so a test command can still write to your
+real `node_modules`. Mutants run your real test suite with your real environment.
+
+Only point bughunter at code and test commands you trust.
 
 ## How it works
 
@@ -206,7 +222,7 @@ Honest list.
 cargo test --workspace
 ```
 
-28 tests: 15 engine, 6 runner, 7 CLI. The runner tests cover killed, survived, timeout,
+34 tests: 15 engine, 7 runner, 12 CLI. The runner tests cover killed, survived, timeout,
 process-group orphan reaping, the `node_modules` symlink, and the concurrency bound.
 
 ## Try it in 30 seconds

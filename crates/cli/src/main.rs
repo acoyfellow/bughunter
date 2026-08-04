@@ -5,15 +5,29 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
+use tokio::process::Command;
+use tokio::time::timeout;
+
+unsafe extern "C" {
+    fn setsid() -> i32;
+    fn killpg(process_group: i32, signal: i32) -> i32;
+}
+
+const SIGNAL_KILL: i32 = 9;
+const NO_SUCH_PROCESS: i32 = 3;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_CONCURRENCY: usize = 4;
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run(env::args().skip(1).collect()).await {
-        eprintln!("error: {error}");
-        std::process::exit(1);
+    match run(env::args().skip(1).collect()).await {
+        Ok(exit_code) if exit_code != 0 => std::process::exit(exit_code),
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -34,6 +48,8 @@ OPTIONS:
   --timeout-ms N        per-mutant timeout, default 30000
   --concurrency N       mutants in flight, default 4
   --skip-baseline       do not verify the suite passes before mutating
+  --fail-on-survivors   gate on survivors and unevaluated mutants
+  --version             print the bughunter version
 
 OPERATORS:
   cond-boundary-gt              >   ->  >=
@@ -52,19 +68,28 @@ STATUSES:
   error      the mutant could not be evaluated
 
 EXIT CODES:
-  0  the run completed and JSON was written
+  0  the run completed and JSON was written without a selected gate failure
   1  a usage, parse, or baseline error occurred
+  2  --fail-on-survivors found one or more surviving mutants; takes precedence over exit 3
+  3  --fail-on-survivors found one or more timed-out or errored mutants and no survivors
 
 A surviving mutant is a fact about your tests, not a proven bug.
 ";
 
-async fn run(arguments: Vec<String>) -> Result<(), String> {
+async fn run(arguments: Vec<String>) -> Result<i32, String> {
     if arguments
         .iter()
-        .any(|argument| matches!(argument.as_str(), "--help" | "-h" | "help" | "--version"))
+        .any(|argument| matches!(argument.as_str(), "--help" | "-h" | "help"))
     {
         print!("{USAGE}");
-        return Ok(());
+        return Ok(0);
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument.as_str() == "--version")
+    {
+        println!("{}", version_output());
+        return Ok(0);
     }
     let options = parse_run_arguments(arguments)?;
     let source_path = options.repository.join(&options.file);
@@ -88,7 +113,32 @@ async fn run(arguments: Vec<String>) -> Result<(), String> {
     let runner = Runner::new(configuration);
     let mut results = runner.run(&generated).await;
     results.sort_by_key(|result| (result.mutant.span_start, result.mutant.operator));
-    write_json(generated.len(), &results).map_err(|error| format!("failed to write JSON: {error}"))
+    write_json(generated.len(), &results)
+        .map_err(|error| format!("failed to write JSON: {error}"))?;
+    Ok(exit_code_for_results(options.fail_on_survivors, &results))
+}
+
+fn version_output() -> String {
+    format!("bughunter {}", env!("CARGO_PKG_VERSION"))
+}
+
+fn exit_code_for_results(fail_on_survivors: bool, results: &[MutantResult]) -> i32 {
+    if !fail_on_survivors {
+        return 0;
+    }
+    if results
+        .iter()
+        .any(|result| result.status == MutantStatus::Survived)
+    {
+        return 2;
+    }
+    if results
+        .iter()
+        .any(|result| matches!(result.status, MutantStatus::Timeout | MutantStatus::Error))
+    {
+        return 3;
+    }
+    0
 }
 
 struct RunOptions {
@@ -100,23 +150,88 @@ struct RunOptions {
     concurrency: usize,
     line_range: Option<LineRange>,
     skip_baseline: bool,
+    fail_on_survivors: bool,
 }
 
 async fn verify_baseline(options: &RunOptions) -> Result<(), String> {
-    let status = tokio::process::Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(format!("({}) 1>&2", options.test_command))
-        .current_dir(&options.repository)
-        .status()
-        .await
+        .current_dir(&options.repository);
+    configure_process_group(&mut command);
+
+    let mut child = command
+        .spawn()
         .map_err(|error| format!("failed to run the baseline test command: {error}"))?;
-    if !status.success() {
-        return Err(format!(
+    let process_group = child
+        .id()
+        .map(|identifier| identifier as i32)
+        .ok_or_else(|| {
+            "failed to run the baseline test command: spawned command has no process identifier"
+                .to_owned()
+        })?;
+
+    match timeout(Duration::from_millis(options.timeout_ms), child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(format!(
             "baseline test command failed with {status} in {}; mutation results would be meaningless because every mutant would be reported killed. Fix the suite, or pass --skip-baseline to override",
             options.repository.display()
-        ));
+        )),
+        Ok(Err(error)) => Err(format!("failed to run the baseline test command: {error}")),
+        Err(_) => {
+            let cleanup_detail = kill_process_group(process_group)
+                .err()
+                .map(|error| error.to_string());
+            let wait_detail = child.wait().await.err().map(|error| error.to_string());
+            Err(baseline_timeout_error(
+                options,
+                cleanup_detail,
+                wait_detail,
+            ))
+        }
+    }
+}
+
+fn configure_process_group(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn kill_process_group(process_group: i32) -> io::Result<()> {
+    if unsafe { killpg(process_group, SIGNAL_KILL) } == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(NO_SUCH_PROCESS) {
+            return Err(error);
+        }
     }
     Ok(())
+}
+
+fn baseline_timeout_error(
+    options: &RunOptions,
+    cleanup_detail: Option<String>,
+    wait_detail: Option<String>,
+) -> String {
+    let cleanup_suffix = match (cleanup_detail, wait_detail) {
+        (None, None) => String::new(),
+        (Some(cleanup_detail), None) => format!("; process-group cleanup failed: {cleanup_detail}"),
+        (None, Some(wait_detail)) => format!("; child reap failed: {wait_detail}"),
+        (Some(cleanup_detail), Some(wait_detail)) => format!(
+            "; process-group cleanup failed: {cleanup_detail}; child reap failed: {wait_detail}"
+        ),
+    };
+    format!(
+        "baseline test command timed out after {} ms in {}; increase --timeout-ms or pass --skip-baseline to override{cleanup_suffix}",
+        options.timeout_ms,
+        options.repository.display()
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +255,7 @@ fn parse_run_arguments(arguments: Vec<String>) -> Result<RunOptions, String> {
     let mut line_range = None;
     let mut json = false;
     let mut skip_baseline = false;
+    let mut fail_on_survivors = false;
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -172,6 +288,7 @@ fn parse_run_arguments(arguments: Vec<String>) -> Result<RunOptions, String> {
             }
             "--json" => json = true,
             "--skip-baseline" => skip_baseline = true,
+            "--fail-on-survivors" => fail_on_survivors = true,
             _ => return Err(format!("unknown argument {argument}")),
         }
     }
@@ -196,6 +313,7 @@ fn parse_run_arguments(arguments: Vec<String>) -> Result<RunOptions, String> {
         concurrency,
         line_range,
         skip_baseline,
+        fail_on_survivors,
     })
 }
 
@@ -293,20 +411,59 @@ fn is_relative_file(path: &Path) -> bool {
 
 fn write_json(total: usize, results: &[MutantResult]) -> io::Result<()> {
     let mut output = io::stdout().lock();
+    write_json_to(total, results, &mut output)
+}
+
+fn write_json_to<W: Write>(
+    total: usize,
+    results: &[MutantResult],
+    output: &mut W,
+) -> io::Result<()> {
     write!(output, "{{\"total\":{total},\"mutants\":[")?;
     for (index, result) in results.iter().enumerate() {
         if index > 0 {
             write!(output, ",")?;
         }
-        write!(
-            output,
-            "{{\"line\":{},\"operator\":\"{}\",\"status\":\"{}\"}}",
-            result.mutant.line,
-            result.mutant.operator.id(),
-            status_id(result.status),
-        )?;
+        write!(output, "{{\"line\":{},\"operator\":", result.mutant.line)?;
+        write_json_string(output, result.mutant.operator.id())?;
+        write!(output, ",\"status\":")?;
+        write_json_string(output, status_id(result.status))?;
+        if let Some(detail) = &result.detail {
+            write!(output, ",\"detail\":")?;
+            write_json_string(output, detail)?;
+        }
+        write!(output, "}}")?;
     }
     writeln!(output, "]}}")
+}
+
+fn write_json_string<W: Write>(output: &mut W, value: &str) -> io::Result<()> {
+    output.write_all(b"\"")?;
+    for character in value.chars() {
+        if let Some(escape) = json_escape(character) {
+            output.write_all(escape)?;
+            continue;
+        }
+        if character <= '\u{001f}' {
+            write!(output, r"\u{:04x}", character as u32)?;
+        } else {
+            write!(output, "{character}")?;
+        }
+    }
+    output.write_all(b"\"")
+}
+
+fn json_escape(character: char) -> Option<&'static [u8]> {
+    match character {
+        '"' => Some(&[92, 34]),
+        '\u{005c}' => Some(&[92, 92]),
+        '\u{0008}' => Some(&[92, 98]),
+        '\u{000c}' => Some(&[92, 102]),
+        '\n' => Some(&[92, 110]),
+        '\r' => Some(&[92, 114]),
+        '\t' => Some(&[92, 116]),
+        _ => None,
+    }
 }
 
 fn status_id(status: MutantStatus) -> &'static str {
@@ -320,8 +477,14 @@ fn status_id(status: MutantStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_line_range, parse_run_arguments, select_line_range, LineRange};
-    use bughunter_engine::{mutants, Operator};
+    use super::{
+        exit_code_for_results, parse_line_range, parse_run_arguments, select_line_range,
+        verify_baseline, version_output, write_json_to, LineRange, RunOptions,
+    };
+    use bughunter_engine::{mutants, Mutant, Operator};
+    use bughunter_runner::{MutantResult, MutantStatus};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn unknown_operator_is_an_error() {
@@ -418,6 +581,154 @@ mod tests {
     fn malformed_line_ranges_are_errors() {
         for value in ["not-a-range", "0-1", "4-3"] {
             assert!(parse_line_range(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn version_output_uses_the_package_version() {
+        assert_eq!(
+            version_output(),
+            format!("bughunter {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn json_serialization_includes_details_only_when_present() {
+        let results = [
+            result(
+                MutantStatus::Error,
+                Some("could not execute: \"missing\"\n"),
+            ),
+            result(MutantStatus::Killed, None),
+        ];
+        let mut output = Vec::new();
+
+        write_json_to(results.len(), &results, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\"detail\":\"could not execute: \\\"missing\\\"\\n\""));
+        assert_eq!(output.matches("\"detail\":").count(), 1);
+    }
+
+    #[test]
+    fn survivors_with_the_flag_exit_two() {
+        assert_eq!(
+            exit_code_for_results(true, &[result(MutantStatus::Survived, None)]),
+            2
+        );
+    }
+
+    #[test]
+    fn survivors_without_the_flag_exit_zero() {
+        assert_eq!(
+            exit_code_for_results(false, &[result(MutantStatus::Survived, None)]),
+            0
+        );
+    }
+
+    #[test]
+    fn all_errors_with_the_flag_exit_three() {
+        assert_eq!(
+            exit_code_for_results(
+                true,
+                &[
+                    result(MutantStatus::Error, Some("command unavailable")),
+                    result(MutantStatus::Error, Some("disk full")),
+                ],
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn all_timeouts_with_the_flag_exit_three() {
+        assert_eq!(
+            exit_code_for_results(
+                true,
+                &[
+                    result(MutantStatus::Timeout, None),
+                    result(MutantStatus::Timeout, None),
+                ],
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn survivor_takes_precedence_over_an_error() {
+        assert_eq!(
+            exit_code_for_results(
+                true,
+                &[
+                    result(MutantStatus::Survived, None),
+                    result(MutantStatus::Error, Some("command unavailable")),
+                ],
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn all_errors_without_the_flag_exit_zero() {
+        assert_eq!(
+            exit_code_for_results(
+                false,
+                &[result(MutantStatus::Error, Some("command unavailable"))],
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn no_survivors_with_the_flag_exit_zero() {
+        assert_eq!(
+            exit_code_for_results(true, &[result(MutantStatus::Killed, None)]),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn hanging_baseline_times_out_and_kills_its_process_group() {
+        let options = RunOptions {
+            repository: std::env::current_dir().unwrap(),
+            file: PathBuf::from("unused.ts"),
+            operators: Vec::new(),
+            test_command: "perl -e 'alarm 5; exec @ARGV' sleep 30".to_owned(),
+            timeout_ms: 1_500,
+            concurrency: 1,
+            line_range: None,
+            skip_baseline: false,
+            fail_on_survivors: false,
+        };
+        let started = Instant::now();
+
+        let error = verify_baseline(&options)
+            .await
+            .expect_err("baseline should time out");
+        let elapsed = started.elapsed();
+
+        println!(
+            "baseline timeout elapsed seconds: {:.3}",
+            elapsed.as_secs_f64()
+        );
+        assert!(error.contains("timed out"), "{error}");
+        assert!(error.contains("--timeout-ms"), "{error}");
+        assert!(error.contains("--skip-baseline"), "{error}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    fn result(status: MutantStatus, detail: Option<&str>) -> MutantResult {
+        MutantResult {
+            mutant: Mutant {
+                line: 1,
+                column: 1,
+                operator: Operator::LogicalAndToOr,
+                span_start: 0,
+                span_end: 1,
+                replacement: "||".to_owned(),
+            },
+            status,
+            detail: detail.map(str::to_owned),
         }
     }
 }

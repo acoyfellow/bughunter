@@ -307,6 +307,15 @@ fn create_run_directory() -> Result<PathBuf, String> {
 }
 
 fn copy_repository(source: &Path, destination: &Path) -> io::Result<()> {
+    copy_directory(source, destination, source, destination)
+}
+
+fn copy_directory(
+    source: &Path,
+    destination: &Path,
+    repository: &Path,
+    materialized_repository: &Path,
+) -> io::Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -316,18 +325,31 @@ fn copy_repository(source: &Path, destination: &Path) -> io::Result<()> {
 
         let source_path = entry.path();
         let destination_path = destination.join(&name);
-        if name == OsStr::new("node_modules") {
-            symlink_absolute(&source_path, &destination_path)?;
-            continue;
-        }
-
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             fs::create_dir(&destination_path)?;
-            copy_repository(&source_path, &destination_path)?;
+            if name == OsStr::new("node_modules") {
+                copy_node_modules_directory(
+                    &source_path,
+                    &destination_path,
+                    repository,
+                    materialized_repository,
+                )?;
+            } else {
+                copy_directory(
+                    &source_path,
+                    &destination_path,
+                    repository,
+                    materialized_repository,
+                )?;
+            }
         } else if file_type.is_symlink() {
-            let target = fs::read_link(&source_path)?;
-            std::os::unix::fs::symlink(target, destination_path)?;
+            copy_symlink(
+                &source_path,
+                &destination_path,
+                repository,
+                materialized_repository,
+            )?;
         } else if file_type.is_file() {
             fs::copy(&source_path, &destination_path)?;
             fs::set_permissions(&destination_path, fs::metadata(&source_path)?.permissions())?;
@@ -336,9 +358,75 @@ fn copy_repository(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn symlink_absolute(source: &Path, destination: &Path) -> io::Result<()> {
-    let absolute_source = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
-    std::os::unix::fs::symlink(absolute_source, destination)
+fn copy_node_modules_directory(
+    source: &Path,
+    destination: &Path,
+    repository: &Path,
+    materialized_repository: &Path,
+) -> io::Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let source_path = entry.path();
+        let destination_path = destination.join(&name);
+        let file_type = entry.file_type()?;
+
+        if file_type.is_symlink() {
+            copy_symlink(
+                &source_path,
+                &destination_path,
+                repository,
+                materialized_repository,
+            )?;
+        } else if file_type.is_file() {
+            symlink_original(&source_path, &destination_path)?;
+        } else if file_type.is_dir() {
+            if node_modules_container(&name, &source_path) {
+                fs::create_dir(&destination_path)?;
+                copy_node_modules_directory(
+                    &source_path,
+                    &destination_path,
+                    repository,
+                    materialized_repository,
+                )?;
+            } else {
+                symlink_original(&source_path, &destination_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn node_modules_container(name: &OsStr, path: &Path) -> bool {
+    name == OsStr::new("node_modules")
+        || name.to_string_lossy().starts_with('@')
+        || name == OsStr::new(".pnpm")
+        || fs::symlink_metadata(path.join("node_modules"))
+            .map(|metadata| metadata.file_type().is_dir())
+            .unwrap_or(false)
+}
+
+fn symlink_original(source: &Path, destination: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(source, destination)
+}
+
+fn copy_symlink(
+    source: &Path,
+    destination: &Path,
+    repository: &Path,
+    materialized_repository: &Path,
+) -> io::Result<()> {
+    let target = match fs::canonicalize(source) {
+        Ok(resolved_target) if resolved_target.starts_with(repository) => materialized_repository
+            .join(
+                resolved_target
+                    .strip_prefix(repository)
+                    .expect("checked prefix"),
+            ),
+        Ok(resolved_target) => resolved_target,
+        Err(_) => fs::read_link(source)?,
+    };
+    std::os::unix::fs::symlink(target, destination)
 }
 
 fn error_result(mutant: Mutant, detail: impl Into<String>) -> MutantResult {
@@ -371,7 +459,7 @@ fn compare_results(left: &MutantResult, right: &MutantResult) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::{killed_count, run_mutants, MutantResult, MutantStatus, RunnerConfig};
+    use super::{killed_count, materialize, run_mutants, MutantResult, MutantStatus, RunnerConfig};
     use bughunter_engine::{Mutant, Operator};
     use std::fs;
     use std::io;
@@ -419,6 +507,52 @@ mod tests {
         }
     }
 
+    struct WorkspaceFixture {
+        root: PathBuf,
+        external_dependency: PathBuf,
+    }
+
+    impl WorkspaceFixture {
+        fn new() -> Self {
+            let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = Path::new("/tmp/bh-work/runner-tests")
+                .join(format!("workspace-{}-{sequence}", std::process::id()));
+            let external_dependency = Path::new("/tmp/bh-work/runner-tests")
+                .join(format!("external-{}-{sequence}", std::process::id()));
+            fs::create_dir_all(root.join("packages/workspace/src")).unwrap();
+            fs::create_dir_all(root.join("apps/web/node_modules/@scope")).unwrap();
+            fs::create_dir_all(&external_dependency).unwrap();
+            fs::write(
+                root.join("packages/workspace/src/value.ts"),
+                "export const value = \"original\";\n",
+            )
+            .unwrap();
+            fs::write(root.join("apps/web/package.json"), "{}\n").unwrap();
+            fs::write(external_dependency.join("package.json"), "{}\n").unwrap();
+            std::os::unix::fs::symlink(
+                "../../../../packages/workspace",
+                root.join("apps/web/node_modules/@scope/name"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                &external_dependency,
+                root.join("apps/web/node_modules/external"),
+            )
+            .unwrap();
+            Self {
+                root,
+                external_dependency,
+            }
+        }
+    }
+
+    impl Drop for WorkspaceFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+            let _ = fs::remove_dir_all(&self.external_dependency);
+        }
+    }
+
     fn mutant(span_start: u32) -> Mutant {
         Mutant {
             line: 1,
@@ -435,11 +569,54 @@ mod tests {
         results.into_iter().next().unwrap()
     }
 
+    #[test]
+    fn materialize_remaps_workspace_package_links_and_keeps_external_links() {
+        let fixture = WorkspaceFixture::new();
+        let source = "export const value = \"original\";\n";
+        let mutation_start = source.find("original").unwrap() as u32;
+        let mutation = Mutant {
+            line: 1,
+            column: mutation_start + 1,
+            operator: Operator::LogicalAndToOr,
+            span_start: mutation_start,
+            span_end: mutation_start + "original".len() as u32,
+            replacement: "mutated".to_owned(),
+        };
+        let configuration = RunnerConfig::new(
+            &fixture.root,
+            "packages/workspace/src/value.ts",
+            "true",
+            Duration::from_secs(1),
+            1,
+        );
+
+        let materialized_tree = materialize(&configuration, &mutation).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(
+                materialized_tree.join("apps/web/node_modules/@scope/name/src/value.ts"),
+            )
+            .unwrap(),
+            "export const value = \"mutated\";\n"
+        );
+        let external_link = materialized_tree.join("apps/web/node_modules/external");
+        assert!(fs::symlink_metadata(&external_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_link(external_link).unwrap(),
+            fs::canonicalize(&fixture.external_dependency).unwrap()
+        );
+
+        fs::remove_dir_all(materialized_tree).unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn nonzero_test_command_kills_the_mutant_and_uses_a_node_modules_symlink() {
+    async fn nonzero_test_command_kills_the_mutant_and_uses_a_node_modules_entry() {
         let fixture = Fixture::new("killed");
         let configuration = fixture.configuration(
-            "test -L node_modules && test -f node_modules/reachable && test \"$(cat source.txt)\" = xbcdef && exit 1",
+            "test -L node_modules/reachable && test \"$(cat source.txt)\" = xbcdef && exit 1",
             Duration::from_secs(2),
             1,
         );
@@ -458,7 +635,7 @@ mod tests {
     async fn zero_test_command_survives_the_mutant() {
         let fixture = Fixture::new("survived");
         let configuration = fixture.configuration(
-            "test -L node_modules && test -f node_modules/reachable && test \"$(cat source.txt)\" = xbcdef",
+            "test -L node_modules/reachable && test \"$(cat source.txt)\" = xbcdef",
             Duration::from_secs(2),
             1,
         );
