@@ -1,0 +1,35 @@
+.gitignore
+  s_7620bbef154386::t_dd633153dbec20 1-2
+Cargo.lock
+  s_7620bbef154386::t_86a47965f4aa9f 1-692
+Cargo.toml
+  s_7620bbef154386::t_a1494cc6a70571 1-3
+crates/cli/Cargo.toml
+  s_7620bbef154386::t_4e1bc15151484a 1-18
+crates/cli/src/main.rs
+  s_7620bbef154386::t_15eb97a2e690ac 1-423
+crates/engine/Cargo.toml
+  s_7620bbef154386::t_d927c2d08885ff 1-17
+crates/engine/src/lib.rs
+  s_7620bbef154386::t_d8b361e4fa92e1 1-426
+crates/runner/Cargo.toml
+  s_7620bbef154386::t_5ce4b1344c3be2 1-14
+crates/runner/src/lib.rs
+  s_7620bbef154386::t_22afd2eb5083ba 1-598
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4857e056fcc687b3279707b94e7675c952e1e9df",
+  "prompts": {},
+  "sessions": {
+    "s_7620bbef154386": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019fc20e-3dfc-7918-be50-2549675e3855",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jordan Coeyman <jcoeyman@cloudflare.com>"
+    }
+  }
+}
