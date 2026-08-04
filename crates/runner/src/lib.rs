@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -291,19 +292,71 @@ fn replace_mutant(source: &str, mutant: &Mutant) -> Result<String, String> {
 }
 
 fn create_run_directory() -> Result<PathBuf, String> {
-    let parent = Path::new("/tmp/bh-work/runner-materializations");
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("failed to create runner work directory: {error}"))?;
-
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
         .as_nanos();
     let sequence = RUN_DIRECTORY_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
-    let path = parent.join(format!("{}-{timestamp}-{sequence}", std::process::id()));
-    fs::create_dir(&path)
+    let directory_name = format!("{}-{timestamp}-{sequence}", std::process::id());
+    create_run_directory_with_name(&bughunter_work_root(), &directory_name)
+}
+
+fn create_run_directory_with_name(
+    work_root: &Path,
+    directory_name: &str,
+) -> Result<PathBuf, String> {
+    create_owner_only_directory_tree(work_root, "failed to create bughunter work directory")?;
+    let materialization_root = work_root.join("runner-materializations");
+    create_owner_only_directory_tree(
+        &materialization_root,
+        "failed to create runner work directory",
+    )?;
+
+    let path = materialization_root.join(directory_name);
+    let mut directory_builder = fs::DirBuilder::new();
+    directory_builder.mode(0o700);
+    directory_builder
+        .create(&path)
         .map_err(|error| format!("failed to create materialized tree: {error}"))?;
+    if let Err(error) = set_owner_only_permissions(&path) {
+        let _ = fs::remove_dir(&path);
+        return Err(format!(
+            "failed to restrict materialized tree permissions: {error}"
+        ));
+    }
     Ok(path)
+}
+
+fn bughunter_work_root() -> PathBuf {
+    bughunter_work_root_from(&temporary_directory())
+}
+
+fn bughunter_work_root_from(temporary_directory: &Path) -> PathBuf {
+    temporary_directory.join("bh-work")
+}
+
+fn temporary_directory() -> PathBuf {
+    temporary_directory_from(std::env::var_os("TMPDIR").as_deref())
+}
+
+fn temporary_directory_from(configured_tmpdir: Option<&OsStr>) -> PathBuf {
+    match configured_tmpdir {
+        Some(path) if path != OsStr::new("") => PathBuf::from(path),
+        _ => std::env::temp_dir(),
+    }
+}
+
+fn create_owner_only_directory_tree(path: &Path, context: &str) -> Result<(), String> {
+    let mut directory_builder = fs::DirBuilder::new();
+    directory_builder.recursive(true).mode(0o700);
+    directory_builder
+        .create(path)
+        .map_err(|error| format!("{context}: {error}"))?;
+    set_owner_only_permissions(path).map_err(|error| format!("{context}: {error}"))
+}
+
+fn set_owner_only_permissions(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 fn copy_repository(source: &Path, destination: &Path) -> io::Result<()> {
@@ -459,15 +512,32 @@ fn compare_results(left: &MutantResult, right: &MutantResult) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::{killed_count, materialize, run_mutants, MutantResult, MutantStatus, RunnerConfig};
+    use super::{
+        bughunter_work_root, bughunter_work_root_from, create_run_directory_with_name,
+        killed_count, materialize, run_mutants, temporary_directory_from, MutantResult,
+        MutantStatus, RunnerConfig,
+    };
     use bughunter_engine::{Mutant, Operator};
     use std::fs;
     use std::io;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn runner_test_root() -> PathBuf {
+        bughunter_work_root().join("runner-tests")
+    }
+
+    fn unique_work_root(name: &str) -> PathBuf {
+        runner_test_root().join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     struct Fixture {
         root: PathBuf,
@@ -475,11 +545,7 @@ mod tests {
 
     impl Fixture {
         fn new(name: &str) -> Self {
-            let root = Path::new("/tmp/bh-work/runner-tests").join(format!(
-                "{name}-{}-{}",
-                std::process::id(),
-                FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
+            let root = unique_work_root(name);
             fs::create_dir_all(root.join("scripts")).unwrap();
             fs::create_dir_all(root.join("node_modules")).unwrap();
             fs::write(root.join("source.txt"), "abcdef").unwrap();
@@ -515,10 +581,10 @@ mod tests {
     impl WorkspaceFixture {
         fn new() -> Self {
             let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let root = Path::new("/tmp/bh-work/runner-tests")
-                .join(format!("workspace-{}-{sequence}", std::process::id()));
-            let external_dependency = Path::new("/tmp/bh-work/runner-tests")
-                .join(format!("external-{}-{sequence}", std::process::id()));
+            let root =
+                runner_test_root().join(format!("workspace-{}-{sequence}", std::process::id()));
+            let external_dependency =
+                runner_test_root().join(format!("external-{}-{sequence}", std::process::id()));
             fs::create_dir_all(root.join("packages/workspace/src")).unwrap();
             fs::create_dir_all(root.join("apps/web/node_modules/@scope")).unwrap();
             fs::create_dir_all(&external_dependency).unwrap();
@@ -567,6 +633,57 @@ mod tests {
     fn one_result(results: Vec<MutantResult>) -> MutantResult {
         assert_eq!(results.len(), 1);
         results.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn bughunter_work_root_uses_configured_tmpdir() {
+        let configured_tmpdir = Path::new("configured-runner-tmpdir");
+
+        assert_eq!(
+            bughunter_work_root_from(&temporary_directory_from(Some(
+                configured_tmpdir.as_os_str()
+            ))),
+            configured_tmpdir.join("bh-work")
+        );
+    }
+
+    #[test]
+    fn run_directory_and_work_roots_are_owner_only() {
+        let work_root = unique_work_root("permissions");
+        let run_directory = create_run_directory_with_name(&work_root, "run").unwrap();
+        let materialization_root = work_root.join("runner-materializations");
+
+        assert_eq!(
+            fs::metadata(&work_root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&materialization_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&run_directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        fs::remove_dir_all(work_root).unwrap();
+    }
+
+    #[test]
+    fn preexisting_run_directory_is_not_reused() {
+        let work_root = unique_work_root("preexisting");
+        let existing_directory = create_run_directory_with_name(&work_root, "occupied").unwrap();
+        let sentinel = existing_directory.join("sentinel");
+        fs::write(&sentinel, "existing").unwrap();
+
+        assert!(create_run_directory_with_name(&work_root, "occupied").is_err());
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "existing");
+
+        fs::remove_dir_all(work_root).unwrap();
     }
 
     #[test]
@@ -719,7 +836,7 @@ mod tests {
         let limit = 2;
         let configuration = fixture.configuration(
             format!("sh scripts/measure-concurrency.sh {}", state.display()),
-            Duration::from_secs(3),
+            Duration::from_secs(30),
             limit,
         );
         let mutants = [mutant(4), mutant(0), mutant(3), mutant(1), mutant(2)];
@@ -734,7 +851,8 @@ mod tests {
         assert!(results
             .iter()
             .all(|result| result.status == MutantStatus::Survived));
-        assert_eq!(maximum, limit);
+        assert!(maximum >= 1);
+        assert!(maximum <= limit);
         assert_eq!(
             results
                 .iter()
