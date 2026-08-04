@@ -10,7 +10,7 @@ your tests execute but do not check. Line coverage cannot tell those apart. This
 $ bughunter run --repo ./my-app --file src/auth.ts \
     --operators logical-and-to-or,equality-strict-to-loose-neg \
     --test 'npx vitest run' --json
-{"total":12,"mutants":[{"line":31,"operator":"logical-and-to-or","status":"survived"}, ...]}
+{"schema_version":1,"total":12,"killed":8,"survived":4,"timeout":0,"error":0,"evaluated":12,"score":0.6666666666666666,"mutants":[{"id":"a1b2c3d4e5f60708","line":31,"operator":"logical-and-to-or","status":"survived"}, ...]}
 ```
 
 ## What it found
@@ -169,37 +169,55 @@ nothing, every mutant `survived`. Neither tells you anything, so the tool declin
 Most survivors are case 2. A generated killing test is only worth having if it **fails against the
 mutant and passes against clean source**; a test that passes both ways proves nothing.
 
-### The score
+### JSON schema and score
+
+Every payload starts with `"schema_version": 1`, so consumers can reject an unknown format instead
+of guessing how to parse it. The payload provides these top-level fields:
+
+| field | meaning |
+|---|---|
+| `total` | all generated mutants, including unevaluated ones |
+| `killed`, `survived`, `timeout`, `error` | explicit integer counts for each status; their sum is `total` |
+| `evaluated` | `killed + survived`, the number of mutants with a test result |
+| `score` | `killed / evaluated`, or `null` when `evaluated` is zero |
+| `mutants` | individual findings, each with its current `line`, operator, status, and stable `id` |
+
+A mutant `id` is a fixed-width lowercase FNV-1a hash of the relative file path, operator name,
+original mutated-span text, and replacement text. It intentionally excludes lines, offsets, and
+absolute paths, so inserting unrelated lines above a mutation changes the human-facing `line` but
+not the machine-facing `id`.
 
 ```
-score = killed / total
+evaluated = killed + survived
+score = killed / (killed + survived)
 ```
 
-That is the whole formula. It answers one question: **when we deliberately broke this file, how
-often did your tests complain?**
+`timeout` and `error` are excluded from the score denominator: a mutant that could not be evaluated
+is missing data, not evidence that the suite did or did not detect it. When no mutants were
+evaluated, `score` is `null`, never `0.0`; zero would falsely claim that the suite caught none when
+nothing was measured. Always report `n = evaluated` next to a score.
 
-- **76%** — we broke it 21 ways, tests caught 16. Five breakages slipped through.
-- **37%** — we broke it 29 ways, tests caught 11. Eighteen slipped through.
+### Mutation density and interpreting score
 
-A higher score means more of your changes get noticed. It is a measure of how much your test suite
-would protect you during a refactor.
+Operator coverage is deliberately narrow: bughunter has eight operators. Do not add operators merely
+to inflate the sample; that would change the access-check fixture's contractual total of 16 mutants
+and break its regression gate. A small file can therefore yield very few mutants, and a score over a
+handful of mutants is an anecdote, not a metric.
+
+Equivalent mutants are semantically identical to the original and cannot be killed by any test, so
+they impose a real ceiling below 1.0. For example, under the Web Streams contract,
+`if (done || !value)` can be equivalent to either condition alone when either condition is sufficient
+to take the same branch. Read the survivor list before chasing a number, and report the sample size
+alongside every score.
 
 The useful contrast is with line coverage. Coverage asks *did this line run?* The score asks *would
 anyone notice if this line were wrong?* A line can run in every test and still be unchecked — see
 the `withinQuota` boundary in the demo above, which has full line coverage and a 0% mutation score.
-That is why the number is worth having.
 
-**Do not compare scores across files.** The denominator is not effort, it is operator sites. A file
-dense with `&&` and `===` guards racks up mutants quickly; a file of straight-line assignments has
-almost none. A 37% guard-heavy validator may be better tested than a 76% file with three branches
-in it. The number is only meaningful against *itself over time*: if a file drops from 70% to 50%,
-someone added logic without adding checks.
-
-Also do not chase 100%. Some mutants are **equivalent** — semantically identical to the original, so
-no test can ever kill them. They are permanently unkillable and this tool does not detect them.
-A very high score can also mean over-specified tests that pin behavior nobody depends on, which
-makes future refactors harder rather than safer. Treat survivors as a to-read list, not a to-do
-list.
+Do not compare scores across files. The denominator is operator sites, not effort. A file dense with
+`&&` and `===` guards racks up mutants quickly; a file of straight-line assignments has almost none.
+A very high score can also mean over-specified tests that pin behavior nobody depends on, making
+future refactors harder rather than safer. Treat survivors as a to-read list, not a to-do list.
 
 ## Limitations
 
@@ -222,7 +240,7 @@ Honest list.
 cargo test --workspace
 ```
 
-34 tests: 15 engine, 7 runner, 12 CLI. The runner tests cover killed, survived, timeout,
+46 tests: 21 CLI, 15 engine, 10 runner. The runner tests cover killed, survived, timeout,
 process-group orphan reaping, the `node_modules` symlink, and the concurrency bound.
 
 ## Try it in 30 seconds

@@ -113,7 +113,7 @@ async fn run(arguments: Vec<String>) -> Result<i32, String> {
     let runner = Runner::new(configuration);
     let mut results = runner.run(&generated).await;
     results.sort_by_key(|result| (result.mutant.span_start, result.mutant.operator));
-    write_json(generated.len(), &results)
+    write_json(&options.file, &source, &results)
         .map_err(|error| format!("failed to write JSON: {error}"))?;
     Ok(exit_code_for_results(options.fail_on_survivors, &results))
 }
@@ -409,22 +409,40 @@ fn is_relative_file(path: &Path) -> bool {
             .any(|component| matches!(component, Component::ParentDir))
 }
 
-fn write_json(total: usize, results: &[MutantResult]) -> io::Result<()> {
+fn write_json(file: &Path, source: &str, results: &[MutantResult]) -> io::Result<()> {
     let mut output = io::stdout().lock();
-    write_json_to(total, results, &mut output)
+    write_json_to(file, source, results, &mut output)
 }
 
 fn write_json_to<W: Write>(
-    total: usize,
+    file: &Path,
+    source: &str,
     results: &[MutantResult],
     output: &mut W,
 ) -> io::Result<()> {
-    write!(output, "{{\"total\":{total},\"mutants\":[")?;
+    let summary = ResultSummary::from_results(results);
+    write!(
+        output,
+        "{{\"schema_version\":1,\"total\":{},\"killed\":{},\"survived\":{},\"timeout\":{},\"error\":{},\"evaluated\":{},\"score\":",
+        summary.total,
+        summary.killed,
+        summary.survived,
+        summary.timeout,
+        summary.error,
+        summary.evaluated,
+    )?;
+    match summary.score {
+        Some(score) => write!(output, "{score}")?,
+        None => write!(output, "null")?,
+    }
+    write!(output, ",\"mutants\":[")?;
     for (index, result) in results.iter().enumerate() {
         if index > 0 {
             write!(output, ",")?;
         }
-        write!(output, "{{\"line\":{},\"operator\":", result.mutant.line)?;
+        write!(output, "{{\"id\":")?;
+        write_json_string(output, &stable_mutant_id(file, source, &result.mutant))?;
+        write!(output, ",\"line\":{},\"operator\":", result.mutant.line)?;
         write_json_string(output, result.mutant.operator.id())?;
         write!(output, ",\"status\":")?;
         write_json_string(output, status_id(result.status))?;
@@ -435,6 +453,74 @@ fn write_json_to<W: Write>(
         write!(output, "}}")?;
     }
     writeln!(output, "]}}")
+}
+
+#[derive(Debug, PartialEq)]
+struct ResultSummary {
+    total: usize,
+    killed: usize,
+    survived: usize,
+    timeout: usize,
+    error: usize,
+    evaluated: usize,
+    score: Option<f64>,
+}
+
+impl ResultSummary {
+    fn from_results(results: &[MutantResult]) -> Self {
+        let mut summary = Self {
+            total: results.len(),
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            error: 0,
+            evaluated: 0,
+            score: None,
+        };
+        for result in results {
+            match result.status {
+                MutantStatus::Killed => summary.killed += 1,
+                MutantStatus::Survived => summary.survived += 1,
+                MutantStatus::Timeout => summary.timeout += 1,
+                MutantStatus::Error => summary.error += 1,
+            }
+        }
+        summary.evaluated = summary.killed + summary.survived;
+        summary.score =
+            (summary.evaluated != 0).then(|| summary.killed as f64 / summary.evaluated as f64);
+        summary
+    }
+}
+
+fn stable_mutant_id(file: &Path, source: &str, mutant: &bughunter_engine::Mutant) -> String {
+    let original = source
+        .get(mutant.span_start as usize..mutant.span_end as usize)
+        .unwrap_or_default();
+    let hash = stable_hash(&[
+        file.to_string_lossy().as_bytes(),
+        mutant.operator.id().as_bytes(),
+        original.as_bytes(),
+        mutant.replacement.as_bytes(),
+    ]);
+    format!("{hash:016x}")
+}
+
+fn stable_hash(fields: &[&[u8]]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = OFFSET_BASIS;
+    for field in fields {
+        for byte in (field.len() as u64)
+            .to_le_bytes()
+            .iter()
+            .chain(field.iter())
+        {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    hash
 }
 
 fn write_json_string<W: Write>(output: &mut W, value: &str) -> io::Result<()> {
@@ -479,11 +565,12 @@ fn status_id(status: MutantStatus) -> &'static str {
 mod tests {
     use super::{
         exit_code_for_results, parse_line_range, parse_run_arguments, select_line_range,
-        verify_baseline, version_output, write_json_to, LineRange, RunOptions,
+        stable_mutant_id, verify_baseline, version_output, write_json_to, LineRange, ResultSummary,
+        RunOptions,
     };
     use bughunter_engine::{mutants, Mutant, Operator};
     use bughunter_runner::{MutantResult, MutantStatus};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -603,11 +690,102 @@ mod tests {
         ];
         let mut output = Vec::new();
 
-        write_json_to(results.len(), &results, &mut output).unwrap();
+        write_json_to(Path::new("fixture.ts"), "&&", &results, &mut output).unwrap();
 
         let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("{\"schema_version\":1,"));
+        assert!(output.contains("\"id\":\""));
         assert!(output.contains("\"detail\":\"could not execute: \\\"missing\\\"\\n\""));
         assert_eq!(output.matches("\"detail\":").count(), 1);
+    }
+
+    #[test]
+    fn result_summary_reports_counts_and_score_for_mixed_statuses() {
+        let results = [
+            result(MutantStatus::Killed, None),
+            result(MutantStatus::Killed, None),
+            result(MutantStatus::Survived, None),
+            result(MutantStatus::Timeout, None),
+            result(MutantStatus::Error, Some("disk full")),
+        ];
+        let summary = ResultSummary::from_results(&results);
+
+        assert_eq!(summary.total, 5);
+        assert_eq!(summary.killed, 2);
+        assert_eq!(summary.survived, 1);
+        assert_eq!(summary.timeout, 1);
+        assert_eq!(summary.error, 1);
+        assert_eq!(summary.evaluated, 3);
+        assert_eq!(summary.score, Some(2.0 / 3.0));
+        assert_eq!(
+            summary.total,
+            summary.killed + summary.survived + summary.timeout + summary.error
+        );
+        let mut output = Vec::new();
+        write_json_to(Path::new("fixture.ts"), "&&", &results, &mut output).unwrap();
+        assert!(String::from_utf8(output).unwrap().starts_with(
+            "{\"schema_version\":1,\"total\":5,\"killed\":2,\"survived\":1,\"timeout\":1,\"error\":1,\"evaluated\":3,\"score\":0.6666666666666666,"
+        ));
+    }
+
+    #[test]
+    fn result_summary_uses_null_score_when_no_mutants_were_evaluated() {
+        let results = [
+            result(MutantStatus::Timeout, None),
+            result(MutantStatus::Error, Some("disk full")),
+        ];
+        let summary = ResultSummary::from_results(&results);
+        let mut output = Vec::new();
+
+        write_json_to(Path::new("fixture.ts"), "&&", &results, &mut output).unwrap();
+
+        assert_eq!(summary.evaluated, 0);
+        assert_eq!(summary.score, None);
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("\"evaluated\":0,\"score\":null"));
+    }
+
+    #[test]
+    fn stable_mutant_id_survives_a_line_shift() {
+        let source = "const ready = left && right;\n";
+        let shifted_source = "\n\nconst ready = left && right;\n";
+        let original = mutants(source, "src/ready.ts", &[Operator::LogicalAndToOr]);
+        let shifted = mutants(shifted_source, "src/ready.ts", &[Operator::LogicalAndToOr]);
+
+        assert_ne!(original[0].line, shifted[0].line);
+        assert_eq!(
+            stable_mutant_id(Path::new("src/ready.ts"), source, &original[0]),
+            stable_mutant_id(Path::new("src/ready.ts"), shifted_source, &shifted[0])
+        );
+    }
+
+    #[test]
+    fn different_operators_at_the_same_location_have_different_ids() {
+        let source = "const ready = left && right;\n";
+        let original = mutants(source, "src/ready.ts", &[Operator::LogicalAndToOr]);
+        let same_location_different_operator = Mutant {
+            operator: Operator::LogicalOrToAnd,
+            replacement: "&&".to_owned(),
+            ..original[0].clone()
+        };
+
+        assert_eq!(
+            original[0].span_start,
+            same_location_different_operator.span_start
+        );
+        assert_eq!(
+            original[0].span_end,
+            same_location_different_operator.span_end
+        );
+        assert_ne!(
+            stable_mutant_id(Path::new("src/ready.ts"), source, &original[0]),
+            stable_mutant_id(
+                Path::new("src/ready.ts"),
+                source,
+                &same_location_different_operator
+            )
+        );
     }
 
     #[test]
@@ -724,7 +902,7 @@ mod tests {
                 column: 1,
                 operator: Operator::LogicalAndToOr,
                 span_start: 0,
-                span_end: 1,
+                span_end: 2,
                 replacement: "||".to_owned(),
             },
             status,

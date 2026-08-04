@@ -12,7 +12,7 @@ if [[ ! -x "$binary" ]]; then
   exit 1
 fi
 
-printf '%s\n' 'CHECK: access-check result total, survivors, timeouts, and errors'
+printf '%s\n' 'CHECK: access-check result schema, counts, score, survivors, timeouts, and errors'
 fixture_json="$("$binary" run \
   --repo examples/access-check \
   --file src/access.ts \
@@ -28,8 +28,40 @@ expected_survivors = [
     (15, "return-false-to-true"),
     (28, "cond-boundary-lt"),
 ]
-if payload["total"] != 16:
-    raise SystemExit("expected total 16, got {}".format(payload["total"]))
+if payload.get("schema_version") != 1:
+    raise SystemExit("expected schema_version 1, got {}".format(payload.get("schema_version")))
+total = payload["total"]
+if total != 16:
+    raise SystemExit("expected total 16, got {}".format(total))
+for mutant in payload["mutants"]:
+    if not isinstance(mutant.get("id"), str) or not mutant["id"]:
+        raise SystemExit(f"expected every mutant to have a non-empty id, got {mutant}")
+counts = {}
+for status in ("killed", "survived", "timeout", "error"):
+    count = payload.get(status)
+    if type(count) is not int:
+        raise SystemExit(f"expected integer {status} count, got {count!r}")
+    observed = sum(mutant["status"] == status for mutant in payload["mutants"])
+    if count != observed:
+        raise SystemExit(f"expected {status} count {observed}, got {count}")
+    counts[status] = count
+if sum(counts.values()) != total:
+    raise SystemExit(f"expected status counts to sum to total, got {counts} and {total}")
+evaluated = payload.get("evaluated")
+if type(evaluated) is not int:
+    raise SystemExit(f"expected integer evaluated count, got {evaluated!r}")
+expected_evaluated = counts["killed"] + counts["survived"]
+if evaluated != expected_evaluated:
+    raise SystemExit(f"expected evaluated {expected_evaluated}, got {evaluated}")
+if "score" not in payload:
+    raise SystemExit("expected score to be present")
+score = payload["score"]
+expected_score = None if evaluated == 0 else counts["killed"] / evaluated
+if expected_score is None:
+    if score is not None:
+        raise SystemExit(f"expected null score, got {score!r}")
+elif type(score) not in (int, float) or score != expected_score:
+    raise SystemExit(f"expected score {expected_score}, got {score!r}")
 survivors = [
     (mutant["line"], mutant["operator"])
     for mutant in payload["mutants"]
@@ -38,9 +70,8 @@ survivors = [
 if survivors != expected_survivors:
     raise SystemExit(f"expected survivors {expected_survivors}, got {survivors}")
 for status in ("timeout", "error"):
-    count = sum(mutant["status"] == status for mutant in payload["mutants"])
-    if count != 0:
-        raise SystemExit(f"expected zero {status} results, got {count}")
+    if counts[status] != 0:
+        raise SystemExit(f"expected zero {status} results, got {counts[status]}")
 '
 
 printf '%s\n' 'CHECK: workspace symlink resolves to the materialized mutant'
