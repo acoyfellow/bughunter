@@ -1,0 +1,18 @@
+[package]
+name = "bughunter-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "bughunter: a mutation-testing CLI for TypeScript"
+repository = "https://github.com/acoyfellow/bughunter"
+keywords = ["mutation-testing", "testing", "typescript", "oxc"]
+categories = ["development-tools::testing"]
+
+[[bin]]
+name = "bughunter"
+path = "src/main.rs"
+
+[dependencies]
+bughunter-engine = { version = "0.1.0", path = "../engine" }
+bughunter-runner = { version = "0.1.0", path = "../runner" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

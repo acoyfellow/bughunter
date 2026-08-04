@@ -1,0 +1,17 @@
+[package]
+name = "bughunter-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "AST-based TypeScript mutation operators for bughunter, built on oxc"
+repository = "https://github.com/acoyfellow/bughunter"
+keywords = ["mutation-testing", "testing", "typescript", "oxc"]
+categories = ["development-tools::testing"]
+
+[dependencies]
+oxc_allocator = "0.143.0"
+oxc_ast = "0.143.0"
+oxc_ast_visit = "0.143.0"
+oxc_parser = "0.143.0"
+oxc_span = "0.143.0"
+oxc_syntax = "0.143.0"

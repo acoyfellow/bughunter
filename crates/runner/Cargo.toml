@@ -1,0 +1,14 @@
+[package]
+name = "bughunter-runner"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Supervised per-mutant test execution for bughunter: timeouts and process-group kill"
+repository = "https://github.com/acoyfellow/bughunter"
+keywords = ["mutation-testing", "testing", "typescript", "oxc"]
+categories = ["development-tools::testing"]
+
+[dependencies]
+bughunter-engine = { version = "0.1.0", path = "../engine" }
+libc = "0.2.189"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }

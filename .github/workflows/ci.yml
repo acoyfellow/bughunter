@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: example fixture baseline passes
+        working-directory: examples/access-check
+        run: node --experimental-strip-types --test src/access.test.ts
+      - name: example fixture yields the expected survivors
+        run: |
+          cargo build
+          ./target/debug/bughunter run \
+            --repo examples/access-check --file src/access.ts \
+            --operators cond-boundary-gt,cond-boundary-lt,logical-and-to-or,logical-or-to-and,equality-strict-to-loose-neg,inequality-to-equality,return-true-to-false,return-false-to-true \
+            --test 'node --experimental-strip-types --test src/access.test.ts' \
+            --json > /tmp/example.json
+          python3 - <<'PY'
+          import json
+          report = json.load(open("/tmp/example.json"))
+          survived = sorted(
+              (mutant["line"], mutant["operator"])
+              for mutant in report["mutants"]
+              if mutant["status"] == "survived"
+          )
+          statuses = [mutant["status"] for mutant in report["mutants"]]
+          assert report["total"] == 16, report["total"]
+          assert survived == [
+              (10, "return-true-to-false"),
+              (15, "return-false-to-true"),
+              (28, "cond-boundary-lt"),
+          ], survived
+          assert statuses.count("timeout") == 0, statuses
+          assert statuses.count("error") == 0, statuses
+          print("FIXTURE_OK", report["total"], survived)
+          PY
