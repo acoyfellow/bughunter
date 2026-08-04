@@ -1,5 +1,7 @@
 # bughunter
 
+![bughunter](docs/social-card.jpg)
+
 A mutation-testing CLI for TypeScript. It changes one operator in your source, runs your real test
 suite against the change, and reports whether any test noticed.
 
@@ -54,8 +56,8 @@ numbers, and nothing notices.
 
 ## Install
 
-Requires a Rust toolchain and a Unix host. Process-group control is mandatory, so Windows is a
-compile error rather than a silent degradation.
+You need a Rust toolchain and a Unix host. bughunter must control process groups. Windows therefore
+fails to compile. It does not degrade silently.
 
 ```
 git clone <this repo> && cd bughunter
@@ -92,11 +94,11 @@ bughunter run --repo <DIR> --file <RELATIVE.ts> --operators <IDS> --test <CMD> -
 | `2` | `--fail-on-survivors` found surviving mutants; takes precedence over `3` |
 | `3` | `--fail-on-survivors` found only timed-out or errored mutants |
 
-Exit `3` matters more than it looks. If every mutant fails to run because a port was bound, the disk
-filled, or the machine ran out of memory, there are zero survivors — and a gate that only checked for
-survivors would report a green build having tested nothing at all. Unevaluated mutants are missing
-data, so they fail the gate separately rather than passing it silently. Survivors win the exit code
-when both are present, because a survivor is the more actionable finding.
+Exit `3` protects you from a false pass. A whole run can fail: a bound port, a full disk, or no
+memory. No mutant then survives, because no mutant ran. A gate that looks only for survivors reports
+success. It tested nothing. Unevaluated mutants therefore fail the gate on their own.
+
+If survivors and unevaluated mutants both appear, bughunter exits `2`. A survivor tells you more.
 
 ### Operators
 
@@ -122,27 +124,28 @@ Eight, each a single-token change:
 | `timeout` | the suite hung; its whole process group was killed |
 | `error` | the mutant could not be evaluated |
 
-`timeout` and `error` are never counted as `killed`. A hung suite is an unknown, not a success.
+bughunter never counts `timeout` or `error` as `killed`. A hung suite is an unknown, not a success.
 
 ## Security and trust model
 
-bughunter does not provide isolation. The `--test` argument is executed with `sh -c`, so it can run
-arbitrary shell commands.
+bughunter does not isolate the code it runs. It runs your `--test` command with `sh -c`. That command
+can do anything your shell can do.
 
-For every mutant, bughunter copies the repository into a temporary directory, preserving the original
-file permissions. Secrets in the repository, including `.env`, `.dev.vars`, credentials, and tokens,
-are copied there in cleartext.
+bughunter copies your repository once per mutant. It copies into a temporary directory. It keeps the
+original file permissions. The copy holds your secrets in cleartext, including `.env`, `.dev.vars`,
+credentials, and tokens.
 
-That copy is created under `$TMPDIR` when set, falling back to the system temporary directory. Each
-run directory is created fresh with mode `0700`, so it is owner-only rather than world-readable, and
-bughunter refuses to reuse a directory that already exists instead of writing into it. On a shared
-host this matters: a fixed, predictable path can be pre-created by another user, who would then be
-handed your cleartext secrets.
+bughunter puts that copy under `$TMPDIR`. If `$TMPDIR` is not set, it uses the system temporary
+directory. It creates each run directory new, with mode `0700`. Only the owner can read it. bughunter
+also refuses to reuse a directory that already exists.
 
-Dependency directories are symlinked to the originals, so a test command can still write to your
-real `node_modules`. Mutants run your real test suite with your real environment.
+This behavior matters on a shared host. Another user can create a predictable path first. That user
+then receives your secrets in cleartext.
 
-Only point bughunter at code and test commands you trust.
+bughunter symlinks dependency directories to the originals. Your test command can therefore write to
+your real `node_modules`. Mutants run your real suite in your real environment.
+
+Point bughunter only at code and test commands that you trust.
 
 ## How it works
 
@@ -160,14 +163,16 @@ span. Consequences:
 Each mutant is evaluated in its own materialized copy of the repository, so mutants cannot see each
 other and your working tree is never modified. `node_modules` is symlinked, not copied.
 
-Execution is supervised by tokio. A `Semaphore` bounds concurrency, each mutant gets a timeout, and
-every test process is spawned into its own process group via `setsid` so a timeout can `killpg` the
-entire group. Vitest spawns worker children; killing only the shell leaves those workers running and
-they will eventually exhaust the host. There is a test that genuinely fails without the `killpg`.
+tokio supervises execution. A `Semaphore` bounds concurrency. Each mutant gets its own timeout.
+bughunter spawns every test process into its own process group with `setsid`. A timeout can therefore
+`killpg` the whole group.
+
+This matters because vitest spawns worker children. If you kill only the shell, those workers keep
+running and eventually exhaust the host. One test in the suite genuinely fails without the `killpg`.
 
 ## Baseline check
 
-Before mutating, the suite is run once, unmutated. If it fails, bughunter refuses to continue:
+bughunter runs your suite once before it mutates anything. If that run fails, bughunter stops:
 
 ```
 error: baseline test command failed with exit status: 1 in /path/to/repo; mutation results
@@ -175,9 +180,9 @@ would be meaningless because every mutant would be reported killed. Fix the suit
 --skip-baseline to override
 ```
 
-This is the difference between a real result and a number-shaped artifact. Against a red suite
-every mutant is reported `killed` and the score reads 100%. Against a vacuous suite that asserts
-nothing, every mutant `survived`. Neither tells you anything, so the tool declines to pretend.
+This check separates a real result from a number-shaped artifact. A red suite reports every mutant as
+`killed`, and the score then reads 100%. A suite that asserts nothing reports every mutant as
+`survived`. Neither number tells you anything. bughunter therefore refuses to produce one.
 
 ## Reading the output
 
@@ -203,10 +208,12 @@ of guessing how to parse it. The payload provides these top-level fields:
 | `score` | `killed / evaluated`, or `null` when `evaluated` is zero |
 | `mutants` | individual findings, each with its current `line`, operator, status, and stable `id` |
 
-A mutant `id` is a fixed-width lowercase FNV-1a hash of the relative file path, operator name,
-original mutated-span text, and replacement text. It intentionally excludes lines, offsets, and
-absolute paths, so inserting unrelated lines above a mutation changes the human-facing `line` but
-not the machine-facing `id`.
+A mutant `id` is a fixed-width lowercase FNV-1a hash. It covers four things: the relative file path,
+the operator name, the original text of the mutated span, and the replacement text.
+
+The hash deliberately excludes line numbers, byte offsets, and absolute paths. Add unrelated lines
+above a mutation and the human-facing `line` changes, but the machine-facing `id` does not. You can
+therefore diff two runs across commits.
 
 ```
 evaluated = killed + survived
@@ -252,8 +259,8 @@ Honest list.
 - **No incremental or cached runs.**
 - **Equivalent mutants are not detected.** Some survivors are semantically identical to the
   original and are therefore unkillable. They will be reported as survivors anyway.
-- **`--concurrency` above your core count will slow things down**, and a suite that binds a fixed
-  port cannot run in parallel with itself at all.
+- **`--concurrency` above your core count slows the run down.** A suite that binds a fixed port
+  cannot run in parallel with itself at all.
 
 ## Tests
 
