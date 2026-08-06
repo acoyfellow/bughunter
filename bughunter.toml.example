@@ -1,0 +1,4 @@
+test = "node --experimental-strip-types --test src/access.test.ts"
+operators = ["cond-boundary-gt", "cond-boundary-lt", "logical-and-to-or", "logical-or-to-and", "equality-strict-to-loose-neg", "inequality-to-equality", "return-true-to-false", "return-false-to-true"]
+timeout = 30
+concurrency = 4

@@ -68,15 +68,16 @@ cargo build --release
 ## Usage
 
 ```
-bughunter run --repo <DIR> --file <RELATIVE.ts|DIR|GLOB> --operators <IDS> --test <CMD> --json [OPTIONS]
+bughunter run --repo <DIR> --file <RELATIVE.ts|DIR|GLOB> --json [OPTIONS]
 ```
 
 | flag | meaning |
 |---|---|
 | `--repo <DIR>` | repository root; the test command runs here |
 | `--file <REL>` | source file, directory, or glob to mutate, relative to `--repo` |
-| `--operators <IDS>` | comma-separated operator ids; an unknown id is a hard error |
-| `--test <CMD>` | test command, run once per mutant |
+| `--config <PATH>` | read configuration from `PATH` instead of `--repo/bughunter.toml` |
+| `--operators <IDS>` | comma-separated operator ids; required unless the config supplies them |
+| `--test <CMD>` | test command, required unless the config supplies it |
 | `--json` | emit JSON on stdout |
 | `--sarif <PATH>` | write a SARIF 2.1.0 log to a path |
 | `--line-range S-E` | only mutate lines S..E inclusive, 1-based |
@@ -87,6 +88,23 @@ bughunter run --repo <DIR> --file <RELATIVE.ts|DIR|GLOB> --operators <IDS> --tes
 | `--version` | print the installed bughunter version |
 
 `--sarif` can be combined with `--json`.
+
+### Configuration
+
+bughunter reads `bughunter.toml` from `--repo` when it exists. Use `--config <PATH>` to read a
+specific file. See [`bughunter.toml.example`](bughunter.toml.example).
+
+```toml
+test = "npx vitest run"
+operators = ["logical-and-to-or", "equality-strict-to-loose-neg"]
+timeout = 30
+concurrency = 4
+```
+
+`timeout` is in seconds. CLI values always take precedence: `--operators`, `--test`,
+`--timeout-ms`, and `--concurrency` override the corresponding config values. Config values override
+the built-in timeout and concurrency defaults. A missing discovered config file is ignored; unknown
+keys and malformed values are errors.
 
 The JSON payload remains on stdout.
 

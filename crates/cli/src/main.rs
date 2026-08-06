@@ -18,6 +18,8 @@ const NO_SUCH_PROCESS: i32 = 3;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_CONCURRENCY: usize = 4;
+const CONFIG_FILE_NAME: &str = "bughunter.toml";
+const MILLISECONDS_PER_SECOND: u64 = 1_000;
 
 #[tokio::main]
 async fn main() {
@@ -34,17 +36,20 @@ async fn main() {
 const USAGE: &str = "bughunter - mutation testing for TypeScript
 
 USAGE:
-  bughunter run --repo <DIR> --file <RELATIVE.ts|DIR|GLOB> --operators <IDS> --test <CMD> --json [OPTIONS]
+  bughunter run --repo <DIR> --file <RELATIVE.ts|DIR|GLOB> --json [OPTIONS]
 
 REQUIRED:
   --repo <DIR>          repository root; the test command runs here
   --file <PATH>         source file, directory, or glob to mutate, relative to --repo
-  --operators <IDS>     comma-separated operator ids (see below)
-  --test <CMD>          test command, run once per mutant
   --json                emit JSON on stdout
-  --sarif <PATH>        write SARIF 2.1.0 output to PATH
+
+CONFIGURATION:
+  --config <PATH>       read configuration from PATH instead of --repo/bughunter.toml
+  --operators <IDS>     comma-separated operator ids; required unless set in config
+  --test <CMD>          test command; required unless set in config
 
 OPTIONS:
+  --sarif <PATH>        write SARIF 2.1.0 output to PATH
   --line-range S-E      only mutate lines S..E inclusive, 1-based
   --timeout-ms N        per-mutant timeout, default 30000
   --concurrency N       mutants in flight, default 4
@@ -183,6 +188,14 @@ struct RunOptions {
     fail_on_survivors: bool,
 }
 
+#[derive(Default)]
+struct ConfigOptions {
+    operators: Option<Vec<Operator>>,
+    test_command: Option<String>,
+    timeout_ms: Option<u64>,
+    concurrency: Option<usize>,
+}
+
 struct FilePlan {
     file: PathBuf,
     source: String,
@@ -290,10 +303,11 @@ fn parse_run_arguments(arguments: Vec<String>) -> Result<RunOptions, String> {
 
     let mut repository = None;
     let mut file = None;
+    let mut configuration_path = None;
     let mut operators = None;
     let mut test_command = None;
-    let mut timeout_ms = DEFAULT_TIMEOUT_MS;
-    let mut concurrency = DEFAULT_CONCURRENCY;
+    let mut timeout_ms = None;
+    let mut concurrency = None;
     let mut line_range = None;
     let mut sarif = None;
     let mut json = false;
@@ -304,6 +318,9 @@ fn parse_run_arguments(arguments: Vec<String>) -> Result<RunOptions, String> {
         match argument.as_str() {
             "--repo" => repository = Some(PathBuf::from(next_value(&mut arguments, "--repo")?)),
             "--file" => file = Some(PathBuf::from(next_value(&mut arguments, "--file")?)),
+            "--config" => {
+                configuration_path = Some(PathBuf::from(next_value(&mut arguments, "--config")?))
+            }
             "--operators" => {
                 operators = Some(parse_operators(&next_value(
                     &mut arguments,
@@ -312,16 +329,16 @@ fn parse_run_arguments(arguments: Vec<String>) -> Result<RunOptions, String> {
             }
             "--test" => test_command = Some(next_value(&mut arguments, "--test")?),
             "--timeout-ms" => {
-                timeout_ms = parse_positive_u64(
+                timeout_ms = Some(parse_positive_u64(
                     &next_value(&mut arguments, "--timeout-ms")?,
                     "--timeout-ms",
-                )?
+                )?)
             }
             "--concurrency" => {
-                concurrency = parse_positive_usize(
+                concurrency = Some(parse_positive_usize(
                     &next_value(&mut arguments, "--concurrency")?,
                     "--concurrency",
-                )?
+                )?)
             }
             "--line-range" => {
                 line_range = Some(parse_line_range(&next_value(
@@ -348,18 +365,199 @@ fn parse_run_arguments(arguments: Vec<String>) -> Result<RunOptions, String> {
         );
     }
 
+    let ConfigOptions {
+        operators: configured_operators,
+        test_command: configured_test_command,
+        timeout_ms: configured_timeout_ms,
+        concurrency: configured_concurrency,
+    } = load_config(&repository, configuration_path.as_deref())?;
+
     Ok(RunOptions {
         repository,
         file,
-        operators: operators.ok_or_else(|| "--operators is required".to_owned())?,
-        test_command: test_command.ok_or_else(|| "--test is required".to_owned())?,
-        timeout_ms,
-        concurrency,
+        operators: operators
+            .or(configured_operators)
+            .ok_or_else(|| "--operators is required".to_owned())?,
+        test_command: test_command
+            .or(configured_test_command)
+            .ok_or_else(|| "--test is required".to_owned())?,
+        timeout_ms: timeout_ms
+            .or(configured_timeout_ms)
+            .unwrap_or(DEFAULT_TIMEOUT_MS),
+        concurrency: concurrency
+            .or(configured_concurrency)
+            .unwrap_or(DEFAULT_CONCURRENCY),
         line_range,
         sarif,
         skip_baseline,
         fail_on_survivors,
     })
+}
+
+fn load_config(repository: &Path, explicit_path: Option<&Path>) -> Result<ConfigOptions, String> {
+    let path = explicit_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| repository.join(CONFIG_FILE_NAME));
+    match fs::read_to_string(&path) {
+        Ok(contents) => parse_config(&contents, &path),
+        Err(error) if explicit_path.is_none() && error.kind() == io::ErrorKind::NotFound => {
+            Ok(ConfigOptions::default())
+        }
+        Err(error) => Err(format!(
+            "failed to read bughunter config {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn parse_config(contents: &str, path: &Path) -> Result<ConfigOptions, String> {
+    let mut configuration = ConfigOptions::default();
+    for (index, line) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(config_parse_error(
+                path,
+                line_number,
+                "expected KEY = VALUE",
+            ));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(config_parse_error(
+                path,
+                line_number,
+                "expected KEY = VALUE",
+            ));
+        }
+        match key {
+            "test" => {
+                if configuration.test_command.is_some() {
+                    return Err(config_parse_error(path, line_number, "duplicate key test"));
+                }
+                let test_command = parse_toml_string(value)
+                    .map_err(|error| config_parse_error(path, line_number, &error))?;
+                if test_command.is_empty() {
+                    return Err(config_parse_error(
+                        path,
+                        line_number,
+                        "test must not be empty",
+                    ));
+                }
+                configuration.test_command = Some(test_command);
+            }
+            "operators" => {
+                if configuration.operators.is_some() {
+                    return Err(config_parse_error(
+                        path,
+                        line_number,
+                        "duplicate key operators",
+                    ));
+                }
+                let operator_ids = parse_toml_string_array(value)
+                    .map_err(|error| config_parse_error(path, line_number, &error))?;
+                let operators = operator_ids
+                    .iter()
+                    .map(|id| Operator::from_id(id).ok_or_else(|| format!("unknown operator {id}")))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| config_parse_error(path, line_number, &error))?;
+                configuration.operators = Some(operators);
+            }
+            "timeout" => {
+                if configuration.timeout_ms.is_some() {
+                    return Err(config_parse_error(
+                        path,
+                        line_number,
+                        "duplicate key timeout",
+                    ));
+                }
+                let seconds = parse_positive_u64(value, "config timeout")
+                    .map_err(|error| config_parse_error(path, line_number, &error))?;
+                let timeout_ms = seconds
+                    .checked_mul(MILLISECONDS_PER_SECOND)
+                    .ok_or_else(|| {
+                        config_parse_error(path, line_number, "config timeout is too large")
+                    })?;
+                configuration.timeout_ms = Some(timeout_ms);
+            }
+            "concurrency" => {
+                if configuration.concurrency.is_some() {
+                    return Err(config_parse_error(
+                        path,
+                        line_number,
+                        "duplicate key concurrency",
+                    ));
+                }
+                configuration.concurrency = Some(
+                    parse_positive_usize(value, "config concurrency")
+                        .map_err(|error| config_parse_error(path, line_number, &error))?,
+                );
+            }
+            _ => {
+                return Err(config_parse_error(
+                    path,
+                    line_number,
+                    &format!("unknown key {key:?}"),
+                ));
+            }
+        }
+    }
+    Ok(configuration)
+}
+
+fn config_parse_error(path: &Path, line_number: usize, detail: &str) -> String {
+    format!(
+        "invalid bughunter config {}:{line_number}: {detail}",
+        path.display()
+    )
+}
+
+fn parse_toml_string(value: &str) -> Result<String, String> {
+    if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
+        return Err("expected a quoted string".to_owned());
+    }
+    let mut result = String::new();
+    let mut characters = value[1..value.len() - 1].chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            let Some(escaped) = characters.next() else {
+                return Err("unterminated escape sequence".to_owned());
+            };
+            match escaped {
+                '"' => result.push('"'),
+                '\\' => result.push('\\'),
+                'n' => result.push('\n'),
+                'r' => result.push('\r'),
+                't' => result.push('\t'),
+                _ => return Err(format!("unsupported escape sequence \\{escaped}")),
+            }
+        } else if character == '"' {
+            return Err("unescaped quote in string".to_owned());
+        } else if character.is_control() {
+            return Err("control characters are not allowed in strings".to_owned());
+        } else {
+            result.push(character);
+        }
+    }
+    Ok(result)
+}
+
+fn parse_toml_string_array(value: &str) -> Result<Vec<String>, String> {
+    if value.len() < 2 || !value.starts_with('[') || !value.ends_with(']') {
+        return Err("expected a list of quoted strings".to_owned());
+    }
+    let values = &value[1..value.len() - 1];
+    if values.trim().is_empty() {
+        return Err("operator list must not be empty".to_owned());
+    }
+    values
+        .split(',')
+        .map(|value| parse_toml_string(value.trim()))
+        .collect()
 }
 
 fn parse_line_range(value: &str) -> Result<LineRange, String> {
@@ -1125,6 +1323,7 @@ mod tests {
         discover_source_files, exit_code_for_results, parse_line_range, parse_run_arguments,
         select_line_range, stable_mutant_id, verify_baseline, version_output, write_json_to,
         write_multi_sarif_to, write_sarif_to, FileRun, LineRange, ResultSummary, RunOptions,
+        CONFIG_FILE_NAME, DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS,
     };
     use bughunter_engine::{mutants, Mutant, Operator};
     use bughunter_runner::{MutantResult, MutantStatus};
@@ -1150,6 +1349,107 @@ mod tests {
             result,
             Err(message) if message == "unknown operator not-an-operator"
         ));
+    }
+
+    #[test]
+    fn config_supplies_values_when_cli_flags_are_absent() {
+        let fixture = config_fixture_directory();
+        fs::write(
+            fixture.join(CONFIG_FILE_NAME),
+            "test = \"printf configured\"\noperators = [\"logical-and-to-or\"]\ntimeout = 7\nconcurrency = 3\n",
+        )
+        .unwrap();
+
+        let options = parse_run_arguments(config_test_arguments(&fixture)).unwrap();
+
+        fs::remove_dir_all(&fixture).unwrap();
+        assert_eq!(options.test_command, "printf configured");
+        assert_eq!(options.operators, vec![Operator::LogicalAndToOr]);
+        assert_eq!(options.timeout_ms, 7_000);
+        assert_eq!(options.concurrency, 3);
+    }
+
+    #[test]
+    fn cli_flags_override_every_configured_value() {
+        let fixture = config_fixture_directory();
+        let configuration = fixture.join("custom.toml");
+        fs::write(
+            &configuration,
+            "test = \"printf configured\"\noperators = [\"logical-and-to-or\"]\ntimeout = 7\nconcurrency = 3\n",
+        )
+        .unwrap();
+        let mut arguments = config_test_arguments(&fixture);
+        arguments.extend([
+            "--config".to_owned(),
+            configuration.to_string_lossy().into_owned(),
+            "--operators".to_owned(),
+            "cond-boundary-gt".to_owned(),
+            "--test".to_owned(),
+            "printf cli".to_owned(),
+            "--timeout-ms".to_owned(),
+            "8000".to_owned(),
+            "--concurrency".to_owned(),
+            "5".to_owned(),
+        ]);
+
+        let options = parse_run_arguments(arguments).unwrap();
+
+        fs::remove_dir_all(&fixture).unwrap();
+        assert_eq!(options.test_command, "printf cli");
+        assert_eq!(options.operators, vec![Operator::CondBoundaryGt]);
+        assert_eq!(options.timeout_ms, 8_000);
+        assert_eq!(options.concurrency, 5);
+    }
+
+    #[test]
+    fn absent_config_leaves_defaults_intact() {
+        let fixture = config_fixture_directory();
+        let mut arguments = config_test_arguments(&fixture);
+        arguments.extend([
+            "--operators".to_owned(),
+            "logical-and-to-or".to_owned(),
+            "--test".to_owned(),
+            "true".to_owned(),
+        ]);
+
+        let options = parse_run_arguments(arguments).unwrap();
+
+        fs::remove_dir_all(&fixture).unwrap();
+        assert_eq!(options.timeout_ms, DEFAULT_TIMEOUT_MS);
+        assert_eq!(options.concurrency, DEFAULT_CONCURRENCY);
+    }
+
+    #[test]
+    fn malformed_config_is_an_error() {
+        let fixture = config_fixture_directory();
+        fs::write(
+            fixture.join(CONFIG_FILE_NAME),
+            "operators = [not-a-string]\n",
+        )
+        .unwrap();
+
+        let error = match parse_run_arguments(config_test_arguments(&fixture)) {
+            Ok(_) => panic!("malformed config must fail"),
+            Err(error) => error,
+        };
+
+        fs::remove_dir_all(&fixture).unwrap();
+        assert!(error.contains("invalid bughunter config"), "{error}");
+        assert!(error.contains("expected a quoted string"), "{error}");
+    }
+
+    #[test]
+    fn unknown_config_key_is_an_error() {
+        let fixture = config_fixture_directory();
+        fs::write(fixture.join(CONFIG_FILE_NAME), "unexpected = \"value\"\n").unwrap();
+
+        let error = match parse_run_arguments(config_test_arguments(&fixture)) {
+            Ok(_) => panic!("unknown config key must fail"),
+            Err(error) => error,
+        };
+
+        fs::remove_dir_all(&fixture).unwrap();
+        assert!(error.contains("unknown key \"unexpected\""), "{error}");
     }
 
     #[test]
@@ -1750,6 +2050,30 @@ mod tests {
         ));
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    fn config_fixture_directory() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "bughunter-config-{}-{timestamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn config_test_arguments(repository: &Path) -> Vec<String> {
+        vec![
+            "run".to_owned(),
+            "--repo".to_owned(),
+            repository.to_string_lossy().into_owned(),
+            "--file".to_owned(),
+            "source.ts".to_owned(),
+            "--json".to_owned(),
+        ]
     }
 
     fn write_crawl_fixture_file(root: &Path, relative_path: &str) {
