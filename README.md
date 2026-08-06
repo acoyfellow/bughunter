@@ -157,26 +157,19 @@ Eight, each a single-token change:
 
 bughunter never counts `timeout` or `error` as `killed`. A hung suite is an unknown, not a success.
 
-## Security and trust model
+## Trust boundary
 
-bughunter does not isolate the code it runs. It runs your `--test` command with `sh -c`. That command
-can do anything your shell can do.
-
-bughunter copies your repository once per mutant. It copies into a temporary directory. It keeps the
-original file permissions. The copy holds your secrets in cleartext, including `.env`, `.dev.vars`,
-credentials, and tokens.
-
-bughunter puts that copy under `$TMPDIR`. If `$TMPDIR` is not set, it uses the system temporary
-directory. It creates each run directory new, with mode `0700`. Only the owner can read it. bughunter
-also refuses to reuse a directory that already exists.
-
-This behavior matters on a shared host. Another user can create a predictable path first. That user
-then receives your secrets in cleartext.
-
-bughunter symlinks dependency directories to the originals. Your test command can therefore write to
-your real `node_modules`. Mutants run your real suite in your real environment.
-
-Point bughunter only at code and test commands that you trust.
+`--test` is trusted input. bughunter is not a security sandbox.
+The baseline check runs before materialization, with its working directory set directly to the real `--repo`.
+For each mutant, bughunter canonicalizes and validates the source path is under `--repo`, then recursively
+copies the repository without `.git` into a mode-`0700` directory under
+`$TMPDIR/bh-work/runner-materializations/<pid>-<time>-<sequence>` and writes the mutated source only there.
+Per-mutant `sh -c` commands run in that temporary copy, which is removed afterward.
+However, `node_modules` regular files and dependency directories are symlinked to their originals, so a
+per-mutant test can write through those links to real dependencies.
+A test command can also name an absolute path and write anywhere the invoking user can access.
+Process-group handling limits timeout orphans; it does not limit filesystem access.
+Do not point bughunter at a repository whose test command or dependencies you do not trust.
 
 ## How it works
 
@@ -191,8 +184,8 @@ span. Consequences:
 - `return true` inside a nested arrow function is found.
 - A file that does not parse is an **error**, not an empty result.
 
-Each mutant is evaluated in its own materialized copy of the repository, so mutants cannot see each
-other and your working tree is never modified. `node_modules` is symlinked, not copied.
+Each mutant is evaluated in its own materialized copy of the repository, so mutations cannot see each
+other or overwrite the original source. `node_modules` is symlinked, not copied; see [Trust boundary](#trust-boundary).
 
 tokio supervises execution. A `Semaphore` bounds concurrency. Each mutant gets its own timeout.
 bughunter spawns every test process into its own process group with `setsid`. A timeout can therefore
