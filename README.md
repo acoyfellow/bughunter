@@ -68,13 +68,13 @@ cargo build --release
 ## Usage
 
 ```
-bughunter run --repo <DIR> --file <RELATIVE.ts> --operators <IDS> --test <CMD> --json [OPTIONS]
+bughunter run --repo <DIR> --file <RELATIVE.ts|DIR|GLOB> --operators <IDS> --test <CMD> --json [OPTIONS]
 ```
 
 | flag | meaning |
 |---|---|
 | `--repo <DIR>` | repository root; the test command runs here |
-| `--file <REL>` | source file to mutate, relative to `--repo` |
+| `--file <REL>` | source file, directory, or glob to mutate, relative to `--repo` |
 | `--operators <IDS>` | comma-separated operator ids; an unknown id is a hard error |
 | `--test <CMD>` | test command, run once per mutant |
 | `--json` | emit JSON on stdout |
@@ -89,6 +89,12 @@ bughunter run --repo <DIR> --file <RELATIVE.ts> --operators <IDS> --test <CMD> -
 `--sarif` can be combined with `--json`.
 
 The JSON payload remains on stdout.
+
+`--file` accepts one source file, a directory crawled recursively, or a glob such as
+`src/**/*.ts`. Directory and glob discovery includes `.ts` and `.tsx` files, sorts paths, and
+skips test files plus `node_modules`, `dist`, `build`, and `.git`. A direct file preserves the
+single-file JSON payload. Multi-file runs add a `files` array with per-file counts and mutants while
+the top-level counts remain the overall roll-up. A selector that matches no source files is an error.
 
 The SARIF log contains one result for each surviving mutant.
 
@@ -261,7 +267,6 @@ future refactors harder rather than safer. Treat survivors as a to-read list, no
 
 Honest list.
 
-- **One file per invocation.** No whole-repo crawl yet.
 - **TypeScript and JavaScript only.**
 - **No test-impact analysis.** Every mutant runs the whole suite you name. Narrow it with
   `--test` and `--line-range`. The cost is roughly `mutants × suite duration ÷ concurrency`.

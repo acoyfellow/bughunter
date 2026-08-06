@@ -34,11 +34,11 @@ async fn main() {
 const USAGE: &str = "bughunter - mutation testing for TypeScript
 
 USAGE:
-  bughunter run --repo <DIR> --file <RELATIVE.ts> --operators <IDS> --test <CMD> --json [OPTIONS]
+  bughunter run --repo <DIR> --file <RELATIVE.ts|DIR|GLOB> --operators <IDS> --test <CMD> --json [OPTIONS]
 
 REQUIRED:
   --repo <DIR>          repository root; the test command runs here
-  --file <RELATIVE.ts>  source file to mutate, relative to --repo
+  --file <PATH>         source file, directory, or glob to mutate, relative to --repo
   --operators <IDS>     comma-separated operator ids (see below)
   --test <CMD>          test command, run once per mutant
   --json                emit JSON on stdout
@@ -93,34 +93,58 @@ async fn run(arguments: Vec<String>) -> Result<i32, String> {
         return Ok(0);
     }
     let options = parse_run_arguments(arguments)?;
-    let source_path = options.repository.join(&options.file);
-    let source = fs::read_to_string(&source_path)
-        .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
-    let generated = select_line_range(
-        try_mutants(&source, &options.file.to_string_lossy(), &options.operators)
-            .map_err(|failure| failure.to_string())?,
-        options.line_range,
-    );
+    let plans = discover_source_files(&options.repository, &options.file)?
+        .into_iter()
+        .map(|file| prepare_file_run(&options, file))
+        .collect::<Result<Vec<_>, _>>()?;
     if !options.skip_baseline {
         verify_baseline(&options).await?;
     }
-    let configuration = RunnerConfig::new(
-        &options.repository,
-        &options.file,
-        format!("({}) 1>&2", options.test_command),
-        Duration::from_millis(options.timeout_ms),
-        options.concurrency,
-    );
-    let runner = Runner::new(configuration);
-    let mut results = runner.run(&generated).await;
-    results.sort_by_key(|result| (result.mutant.span_start, result.mutant.operator));
-    write_json(&options.file, &source, &results)
-        .map_err(|error| format!("failed to write JSON: {error}"))?;
-    if let Some(path) = &options.sarif {
-        write_sarif(path, &options.file, &source, &results)
-            .map_err(|error| format!("failed to write SARIF: {error}"))?;
+
+    let mut file_runs = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let configuration = RunnerConfig::new(
+            &options.repository,
+            &plan.file,
+            format!("({}) 1>&2", options.test_command),
+            Duration::from_millis(options.timeout_ms),
+            options.concurrency,
+        );
+        let runner = Runner::new(configuration);
+        let mut results = runner.run(&plan.mutants).await;
+        results.sort_by_key(|result| (result.mutant.span_start, result.mutant.operator));
+        file_runs.push(FileRun {
+            file: plan.file,
+            source: plan.source,
+            results,
+        });
     }
-    Ok(exit_code_for_results(options.fail_on_survivors, &results))
+
+    if file_runs.len() == 1 {
+        let file_run = &file_runs[0];
+        write_json(&file_run.file, &file_run.source, &file_run.results)
+            .map_err(|error| format!("failed to write JSON: {error}"))?;
+    } else {
+        write_multi_json(&file_runs).map_err(|error| format!("failed to write JSON: {error}"))?;
+    }
+    if let Some(path) = &options.sarif {
+        if file_runs.len() == 1 {
+            let file_run = &file_runs[0];
+            write_sarif(path, &file_run.file, &file_run.source, &file_run.results)
+                .map_err(|error| format!("failed to write SARIF: {error}"))?;
+        } else {
+            write_multi_sarif(path, &file_runs)
+                .map_err(|error| format!("failed to write SARIF: {error}"))?;
+        }
+    }
+    Ok(exit_code_for_results(
+        options.fail_on_survivors,
+        &file_runs
+            .iter()
+            .flat_map(|file_run| file_run.results.iter())
+            .cloned()
+            .collect::<Vec<_>>(),
+    ))
 }
 
 fn version_output() -> String {
@@ -157,6 +181,18 @@ struct RunOptions {
     sarif: Option<PathBuf>,
     skip_baseline: bool,
     fail_on_survivors: bool,
+}
+
+struct FilePlan {
+    file: PathBuf,
+    source: String,
+    mutants: Vec<bughunter_engine::Mutant>,
+}
+
+struct FileRun {
+    file: PathBuf,
+    source: String,
+    results: Vec<MutantResult>,
 }
 
 async fn verify_baseline(options: &RunOptions) -> Result<(), String> {
@@ -306,9 +342,9 @@ fn parse_run_arguments(arguments: Vec<String>) -> Result<RunOptions, String> {
     }
     let repository = repository.ok_or_else(|| "--repo is required".to_owned())?;
     let file = file.ok_or_else(|| "--file is required".to_owned())?;
-    if !is_relative_file(&file) {
+    if !is_relative_selector(&file) {
         return Err(
-            "--file must be a non-empty relative path without parent components".to_owned(),
+            "--file must be a non-empty relative path or glob without parent components".to_owned(),
         );
     }
 
@@ -410,7 +446,7 @@ fn parse_positive_usize(value: &str, option: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
-fn is_relative_file(path: &Path) -> bool {
+fn is_relative_selector(path: &Path) -> bool {
     !path.as_os_str().is_empty()
         && path.is_relative()
         && !path
@@ -418,9 +454,333 @@ fn is_relative_file(path: &Path) -> bool {
             .any(|component| matches!(component, Component::ParentDir))
 }
 
+fn prepare_file_run(options: &RunOptions, file: PathBuf) -> Result<FilePlan, String> {
+    let source_path = options.repository.join(&file);
+    let source = fs::read_to_string(&source_path)
+        .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
+    let mutants = select_line_range(
+        try_mutants(&source, &file.to_string_lossy(), &options.operators)
+            .map_err(|failure| failure.to_string())?,
+        options.line_range,
+    );
+    Ok(FilePlan {
+        file,
+        source,
+        mutants,
+    })
+}
+
+fn discover_source_files(repository: &Path, selector: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    if has_glob_pattern(selector) {
+        collect_source_files(repository, repository, &mut files)?;
+        files.retain(|file| glob_matches(selector, file));
+    } else {
+        let selected_path = repository.join(selector);
+        let metadata = fs::metadata(&selected_path).map_err(|error| {
+            format!(
+                "failed to inspect --file {}: {error}",
+                selected_path.display()
+            )
+        })?;
+        if metadata.is_file() {
+            if !is_test_file(selector) && !has_ignored_directory_component(selector) {
+                files.push(selector.to_path_buf());
+            }
+        } else if metadata.is_dir() {
+            collect_source_files(&selected_path, repository, &mut files)?;
+        } else {
+            return Err(format!(
+                "--file {} must be a regular file, directory, or glob",
+                selector.display()
+            ));
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        return Err(format!(
+            "no TypeScript source files matched --file {}",
+            selector.display()
+        ));
+    }
+    Ok(files)
+}
+
+fn collect_source_files(
+    directory: &Path,
+    repository: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if is_ignored_directory(directory) {
+        return Ok(());
+    }
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("failed to read directory {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read directory entry in {}: {error}",
+                directory.display()
+            )
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "failed to inspect directory entry {}: {error}",
+                path.display()
+            )
+        })?;
+        if file_type.is_dir() {
+            if !is_ignored_directory(&path) {
+                collect_source_files(&path, repository, files)?;
+            }
+        } else if file_type.is_file() && is_source_file(&path) {
+            let relative_path = path.strip_prefix(repository).map_err(|error| {
+                format!(
+                    "failed to make discovered file {} relative to {}: {error}",
+                    path.display(),
+                    repository.display()
+                )
+            })?;
+            files.push(relative_path.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+fn is_ignored_directory(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_ignored_directory_name)
+}
+
+fn has_ignored_directory_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(component, Component::Normal(name) if name.to_str().is_some_and(is_ignored_directory_name))
+    })
+}
+
+fn is_ignored_directory_name(name: &str) -> bool {
+    matches!(name, "node_modules" | "dist" | "build" | ".git")
+}
+
+fn is_source_file(path: &Path) -> bool {
+    let extension = path.extension().and_then(|value| value.to_str());
+    matches!(extension, Some("ts" | "tsx")) && !is_test_file(path)
+}
+
+fn is_test_file(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(name)
+            if name.ends_with(".test.ts")
+                || name.ends_with(".spec.ts")
+                || name.ends_with(".test.tsx")
+                || name.ends_with(".spec.tsx")
+    )
+}
+
+fn has_glob_pattern(path: &Path) -> bool {
+    path.to_string_lossy()
+        .chars()
+        .any(|character| matches!(character, '*' | '?' | '['))
+}
+
+fn glob_matches(pattern: &Path, candidate: &Path) -> bool {
+    let pattern = pattern.to_string_lossy();
+    let pattern_segments = pattern
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>();
+    let candidate_segments = candidate
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(segment) => segment.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    glob_segments_match(&pattern_segments, &candidate_segments)
+}
+
+fn glob_segments_match(pattern: &[&str], candidate: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => candidate.is_empty(),
+        Some((&"**", remaining_pattern)) => {
+            glob_segments_match(remaining_pattern, candidate)
+                || (!candidate.is_empty() && glob_segments_match(pattern, &candidate[1..]))
+        }
+        Some((segment, remaining_pattern)) => {
+            candidate
+                .split_first()
+                .is_some_and(|(candidate_segment, remaining_candidate)| {
+                    glob_segment_matches(segment, candidate_segment)
+                        && glob_segments_match(remaining_pattern, remaining_candidate)
+                })
+        }
+    }
+}
+
+fn glob_segment_matches(pattern: &str, candidate: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let candidate = candidate.chars().collect::<Vec<_>>();
+    glob_characters_match(&pattern, &candidate)
+}
+
+fn glob_characters_match(pattern: &[char], candidate: &[char]) -> bool {
+    match pattern.split_first() {
+        None => candidate.is_empty(),
+        Some(('*', remaining_pattern)) => {
+            glob_characters_match(remaining_pattern, candidate)
+                || (!candidate.is_empty() && glob_characters_match(pattern, &candidate[1..]))
+        }
+        Some(('?', remaining_pattern)) => {
+            candidate
+                .split_first()
+                .is_some_and(|(_, remaining_candidate)| {
+                    glob_characters_match(remaining_pattern, remaining_candidate)
+                })
+        }
+        Some(('[', remaining_pattern)) => {
+            match remaining_pattern
+                .iter()
+                .position(|character| *character == ']')
+            {
+                Some(closing_index) => candidate.split_first().is_some_and(
+                    |(candidate_character, remaining_candidate)| {
+                        glob_character_class_matches(
+                            &remaining_pattern[..closing_index],
+                            *candidate_character,
+                        ) && glob_characters_match(
+                            &remaining_pattern[closing_index + 1..],
+                            remaining_candidate,
+                        )
+                    },
+                ),
+                None => candidate.split_first().is_some_and(
+                    |(candidate_character, remaining_candidate)| {
+                        *candidate_character == '['
+                            && glob_characters_match(remaining_pattern, remaining_candidate)
+                    },
+                ),
+            }
+        }
+        Some((character, remaining_pattern)) => {
+            candidate
+                .split_first()
+                .is_some_and(|(candidate_character, remaining_candidate)| {
+                    character == candidate_character
+                        && glob_characters_match(remaining_pattern, remaining_candidate)
+                })
+        }
+    }
+}
+
+fn glob_character_class_matches(class: &[char], candidate: char) -> bool {
+    let (is_negated, class) = match class.split_first() {
+        Some(('!' | '^', remaining_class)) => (true, remaining_class),
+        _ => (false, class),
+    };
+    let mut index = 0;
+    let mut matches = false;
+    while index < class.len() {
+        if index + 2 < class.len() && class[index + 1] == '-' {
+            matches |= class[index] <= candidate && candidate <= class[index + 2];
+            index += 3;
+        } else {
+            matches |= class[index] == candidate;
+            index += 1;
+        }
+    }
+    matches != is_negated
+}
+
 fn write_json(file: &Path, source: &str, results: &[MutantResult]) -> io::Result<()> {
     let mut output = io::stdout().lock();
     write_json_to(file, source, results, &mut output)
+}
+
+fn write_multi_json(file_runs: &[FileRun]) -> io::Result<()> {
+    let mut output = io::stdout().lock();
+    write_multi_json_to(file_runs, &mut output)
+}
+
+fn write_multi_json_to<W: Write>(file_runs: &[FileRun], output: &mut W) -> io::Result<()> {
+    let summary = ResultSummary::from_file_runs(file_runs);
+    write!(
+        output,
+        "{{\"schema_version\":2,\"total\":{},\"killed\":{},\"survived\":{},\"timeout\":{},\"error\":{},\"evaluated\":{},\"score\":",
+        summary.total,
+        summary.killed,
+        summary.survived,
+        summary.timeout,
+        summary.error,
+        summary.evaluated,
+    )?;
+    match summary.score {
+        Some(score) => write!(output, "{score}")?,
+        None => write!(output, "null")?,
+    }
+    write!(output, ",\"files\":[")?;
+    for (index, file_run) in file_runs.iter().enumerate() {
+        if index > 0 {
+            write!(output, ",")?;
+        }
+        write_json_file_entry(file_run, output)?;
+    }
+    writeln!(output, "]}}")
+}
+
+fn write_json_file_entry<W: Write>(file_run: &FileRun, output: &mut W) -> io::Result<()> {
+    let summary = ResultSummary::from_results(&file_run.results);
+    let generated = try_mutants(
+        &file_run.source,
+        &file_run.file.to_string_lossy(),
+        &Operator::ALL,
+    )
+    .unwrap_or_default();
+    write!(output, "{{\"file\":")?;
+    write_json_string(output, &file_run.file.to_string_lossy())?;
+    write!(
+        output,
+        ",\"total\":{},\"killed\":{},\"survived\":{},\"timeout\":{},\"error\":{},\"evaluated\":{},\"score\":",
+        summary.total,
+        summary.killed,
+        summary.survived,
+        summary.timeout,
+        summary.error,
+        summary.evaluated,
+    )?;
+    match summary.score {
+        Some(score) => write!(output, "{score}")?,
+        None => write!(output, "null")?,
+    }
+    write!(output, ",\"mutants\":[")?;
+    for (index, result) in file_run.results.iter().enumerate() {
+        if index > 0 {
+            write!(output, ",")?;
+        }
+        write!(output, "{{\"id\":")?;
+        let occurrence_index = operator_occurrence_index(&generated, &result.mutant);
+        write_json_string(
+            output,
+            &stable_mutant_id(
+                &file_run.file,
+                &file_run.source,
+                &result.mutant,
+                occurrence_index,
+            ),
+        )?;
+        write!(output, ",\"line\":{},\"operator\":", result.mutant.line)?;
+        write_json_string(output, result.mutant.operator.id())?;
+        write!(output, ",\"status\":")?;
+        write_json_string(output, status_id(result.status))?;
+        if let Some(detail) = &result.detail {
+            write!(output, ",\"detail\":")?;
+            write_json_string(output, detail)?;
+        }
+        write!(output, "}}")?;
+    }
+    write!(output, "]}}")
 }
 
 fn write_json_to<W: Write>(
@@ -473,6 +833,78 @@ fn write_json_to<W: Write>(
 fn write_sarif(path: &Path, file: &Path, source: &str, results: &[MutantResult]) -> io::Result<()> {
     let mut output = fs::File::create(path)?;
     write_sarif_to(file, source, results, &mut output)
+}
+
+fn write_multi_sarif(path: &Path, file_runs: &[FileRun]) -> io::Result<()> {
+    let mut output = fs::File::create(path)?;
+    write_multi_sarif_to(file_runs, &mut output)
+}
+
+fn write_multi_sarif_to<W: Write>(file_runs: &[FileRun], output: &mut W) -> io::Result<()> {
+    let mut operators = Vec::new();
+    for file_run in file_runs {
+        for operator in surviving_operators(&file_run.results) {
+            if !operators.contains(&operator) {
+                operators.push(operator);
+            }
+        }
+    }
+
+    output.write_all(b"{\"$schema\":")?;
+    write_json_string(output, "https://json.schemastore.org/sarif-2.1.0.json")?;
+    output.write_all(
+        b",\"version\":\"2.1.0\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"bughunter\",\"informationUri\":\"https://github.com/acoyfellow/bughunter\",\"semanticVersion\":",
+    )?;
+    write_json_string(output, env!("CARGO_PKG_VERSION"))?;
+    output.write_all(b",\"rules\":[")?;
+    for (index, operator) in operators.iter().enumerate() {
+        if index > 0 {
+            output.write_all(b",")?;
+        }
+        output.write_all(b"{\"id\":")?;
+        write_json_string(output, operator.id())?;
+        output.write_all(b"}")?;
+    }
+    output.write_all(b"]}},\"results\":[")?;
+    let mut result_count = 0;
+    for file_run in file_runs {
+        let generated = try_mutants(
+            &file_run.source,
+            &file_run.file.to_string_lossy(),
+            &Operator::ALL,
+        )
+        .unwrap_or_default();
+        for result in &file_run.results {
+            if result.status != MutantStatus::Survived {
+                continue;
+            }
+            if result_count > 0 {
+                output.write_all(b",")?;
+            }
+            result_count += 1;
+            let occurrence_index = operator_occurrence_index(&generated, &result.mutant);
+            let mutant_id = stable_mutant_id(
+                &file_run.file,
+                &file_run.source,
+                &result.mutant,
+                occurrence_index,
+            );
+            output.write_all(b"{\"ruleId\":")?;
+            write_json_string(output, result.mutant.operator.id())?;
+            output.write_all(b",\"message\":{\"text\":\"Surviving mutant\"},\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":")?;
+            write_json_string(output, &file_run.file.to_string_lossy())?;
+            output.write_all(b"},\"region\":")?;
+            write!(
+                output,
+                "{{\"startLine\":{},\"startColumn\":{}}}",
+                result.mutant.line, result.mutant.column
+            )?;
+            output.write_all(b"}}],\"partialFingerprints\":{\"bughunterMutantId/v1\":")?;
+            write_json_string(output, &mutant_id)?;
+            output.write_all(b"}}")?;
+        }
+    }
+    output.write_all(b"]}]}")
 }
 
 fn write_sarif_to<W: Write>(
@@ -574,6 +1006,30 @@ impl ResultSummary {
             (summary.evaluated != 0).then(|| summary.killed as f64 / summary.evaluated as f64);
         summary
     }
+
+    fn from_file_runs(file_runs: &[FileRun]) -> Self {
+        let mut summary = Self {
+            total: 0,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            error: 0,
+            evaluated: 0,
+            score: None,
+        };
+        for file_run in file_runs {
+            let file_summary = Self::from_results(&file_run.results);
+            summary.total += file_summary.total;
+            summary.killed += file_summary.killed;
+            summary.survived += file_summary.survived;
+            summary.timeout += file_summary.timeout;
+            summary.error += file_summary.error;
+            summary.evaluated += file_summary.evaluated;
+        }
+        summary.score =
+            (summary.evaluated != 0).then(|| summary.killed as f64 / summary.evaluated as f64);
+        summary
+    }
 }
 
 fn stable_mutant_id(
@@ -666,14 +1122,15 @@ fn status_id(status: MutantStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        exit_code_for_results, parse_line_range, parse_run_arguments, select_line_range,
-        stable_mutant_id, verify_baseline, version_output, write_json_to, write_sarif_to,
-        LineRange, ResultSummary, RunOptions,
+        discover_source_files, exit_code_for_results, parse_line_range, parse_run_arguments,
+        select_line_range, stable_mutant_id, verify_baseline, version_output, write_json_to,
+        write_multi_sarif_to, write_sarif_to, FileRun, LineRange, ResultSummary, RunOptions,
     };
     use bughunter_engine::{mutants, Mutant, Operator};
     use bughunter_runner::{MutantResult, MutantStatus};
+    use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn unknown_operator_is_an_error() {
@@ -1101,6 +1558,156 @@ mod tests {
         );
     }
 
+    #[test]
+    fn discovery_skips_test_files_and_ignored_directories() {
+        let fixture = crawl_fixture_directory();
+        write_crawl_fixture_file(&fixture, "src/keep.ts");
+        write_crawl_fixture_file(&fixture, "src/view.tsx");
+        write_crawl_fixture_file(&fixture, "src/keep.test.ts");
+        write_crawl_fixture_file(&fixture, "src/keep.spec.ts");
+        write_crawl_fixture_file(&fixture, "src/node_modules/dependency.ts");
+        write_crawl_fixture_file(&fixture, "src/dist/output.ts");
+        write_crawl_fixture_file(&fixture, "src/build/output.ts");
+
+        let discovered = discover_source_files(&fixture, Path::new("src")).unwrap();
+
+        fs::remove_dir_all(&fixture).unwrap();
+        assert_eq!(
+            discovered,
+            vec![PathBuf::from("src/keep.ts"), PathBuf::from("src/view.tsx")]
+        );
+    }
+
+    #[test]
+    fn discovery_is_deterministically_ordered() {
+        let fixture = crawl_fixture_directory();
+        write_crawl_fixture_file(&fixture, "src/zeta.ts");
+        write_crawl_fixture_file(&fixture, "src/alpha.ts");
+        write_crawl_fixture_file(&fixture, "src/nested/beta.ts");
+
+        let first = discover_source_files(&fixture, Path::new("src")).unwrap();
+        let second = discover_source_files(&fixture, Path::new("src/**/*.ts")).unwrap();
+
+        fs::remove_dir_all(&fixture).unwrap();
+        let expected = vec![
+            PathBuf::from("src/alpha.ts"),
+            PathBuf::from("src/nested/beta.ts"),
+            PathBuf::from("src/zeta.ts"),
+        ];
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+    }
+
+    #[test]
+    fn glob_with_zero_matches_is_an_error() {
+        let fixture = crawl_fixture_directory();
+        write_crawl_fixture_file(&fixture, "src/keep.ts");
+
+        let error = discover_source_files(&fixture, Path::new("src/*.tsx")).unwrap_err();
+
+        fs::remove_dir_all(&fixture).unwrap();
+        assert_eq!(error, "no TypeScript source files matched --file src/*.tsx");
+    }
+
+    #[test]
+    fn per_file_roll_up_counts_sum_to_the_overall_totals() {
+        let file_runs = vec![
+            FileRun {
+                file: PathBuf::from("src/first.ts"),
+                source: "const first = left && right;\n".to_owned(),
+                results: vec![
+                    result(MutantStatus::Killed, None),
+                    result(MutantStatus::Survived, None),
+                ],
+            },
+            FileRun {
+                file: PathBuf::from("src/second.ts"),
+                source: "const second = left && right;\n".to_owned(),
+                results: vec![
+                    result(MutantStatus::Timeout, None),
+                    result(MutantStatus::Error, Some("disk full")),
+                ],
+            },
+        ];
+        let overall = ResultSummary::from_file_runs(&file_runs);
+        let per_file = file_runs
+            .iter()
+            .map(|file_run| ResultSummary::from_results(&file_run.results))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            overall.total,
+            per_file.iter().map(|summary| summary.total).sum::<usize>()
+        );
+        assert_eq!(
+            overall.killed,
+            per_file.iter().map(|summary| summary.killed).sum::<usize>()
+        );
+        assert_eq!(
+            overall.survived,
+            per_file
+                .iter()
+                .map(|summary| summary.survived)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            overall.timeout,
+            per_file
+                .iter()
+                .map(|summary| summary.timeout)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            overall.error,
+            per_file.iter().map(|summary| summary.error).sum::<usize>()
+        );
+        assert_eq!(
+            overall.evaluated,
+            per_file
+                .iter()
+                .map(|summary| summary.evaluated)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn multi_file_sarif_uses_relative_artifact_uris() {
+        let first_source = "const first = left && right;\n";
+        let second_source = "const second = top && bottom;\n";
+        let first_mutant =
+            mutants(first_source, "src/first.ts", &[Operator::LogicalAndToOr]).remove(0);
+        let second_mutant =
+            mutants(second_source, "src/second.ts", &[Operator::LogicalAndToOr]).remove(0);
+        let file_runs = vec![
+            FileRun {
+                file: PathBuf::from("src/first.ts"),
+                source: first_source.to_owned(),
+                results: vec![MutantResult {
+                    mutant: first_mutant,
+                    status: MutantStatus::Survived,
+                    detail: None,
+                }],
+            },
+            FileRun {
+                file: PathBuf::from("src/second.ts"),
+                source: second_source.to_owned(),
+                results: vec![MutantResult {
+                    mutant: second_mutant,
+                    status: MutantStatus::Survived,
+                    detail: None,
+                }],
+            },
+        ];
+        let mut output = Vec::new();
+
+        write_multi_sarif_to(&file_runs, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\"uri\":\"src/first.ts\""));
+        assert!(output.contains("\"uri\":\"src/second.ts\""));
+        assert!(!output.contains("\"uri\":\"/"));
+    }
+
     #[tokio::test]
     async fn hanging_baseline_times_out_and_kills_its_process_group() {
         let options = RunOptions {
@@ -1130,6 +1737,25 @@ mod tests {
         assert!(error.contains("--timeout-ms"), "{error}");
         assert!(error.contains("--skip-baseline"), "{error}");
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    fn crawl_fixture_directory() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "bughunter-crawl-{}-{timestamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn write_crawl_fixture_file(root: &Path, relative_path: &str) {
+        let path = root.join(relative_path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "export const value = true;\n").unwrap();
     }
 
     fn result(status: MutantStatus, detail: Option<&str>) -> MutantResult {
