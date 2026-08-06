@@ -216,6 +216,8 @@ operator occurrence index. The index counts that operator's mutations in source 
 The hash excludes line numbers, byte offsets, and absolute paths. Add unrelated lines above a
 mutation and its `line` changes, but its `id` does not. IDs stay stable across line shifts.
 
+Adding or removing an earlier mutation of the same operator renumbers later IDs in that file.
+
 ```
 evaluated = killed + survived
 score = killed / (killed + survived)

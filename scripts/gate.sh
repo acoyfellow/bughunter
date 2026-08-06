@@ -28,8 +28,8 @@ expected_survivors = [
     (15, "return-false-to-true"),
     (28, "cond-boundary-lt"),
 ]
-if payload.get("schema_version") != 1:
-    raise SystemExit("expected schema_version 1, got {}".format(payload.get("schema_version")))
+if payload.get("schema_version") != 2:
+    raise SystemExit("expected schema_version 2, got {}".format(payload.get("schema_version")))
 total = payload["total"]
 if total != 16:
     raise SystemExit("expected total 16, got {}".format(total))
