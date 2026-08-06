@@ -1329,7 +1329,10 @@ mod tests {
     use bughunter_runner::{MutantResult, MutantStatus};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    static FIXTURE_DIRECTORY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn unknown_operator_is_an_error() {
@@ -2044,8 +2047,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = FIXTURE_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "bughunter-crawl-{}-{timestamp}",
+            "bughunter-crawl-{}-{timestamp}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).unwrap();
@@ -2057,8 +2061,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = FIXTURE_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "bughunter-config-{}-{timestamp}",
+            "bughunter-config-{}-{timestamp}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).unwrap();
