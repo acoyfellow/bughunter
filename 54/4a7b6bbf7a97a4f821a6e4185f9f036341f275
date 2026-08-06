@@ -1,0 +1,19 @@
+.internal/receipts/29-trust-boundary.md
+  s_f10e36fcc51c4f::t_24879850544ebb 1-301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "544a7b6bbf7a97a4f821a6e4185f9f036341f275",
+  "prompts": {},
+  "sessions": {
+    "s_f10e36fcc51c4f": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019f6f75-18e2-7e65-ab8b-4f58f529661f",
+        "model": "claude-opus-5"
+      },
+      "human_author": "acoyfellow <coeyman@gmail.com>"
+    }
+  }
+}
