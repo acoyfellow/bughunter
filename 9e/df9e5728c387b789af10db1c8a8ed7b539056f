@@ -1,0 +1,29 @@
+README.md
+  s_e050e2bde8a246::t_38098c0740745c 219-220
+scripts/gate.sh
+  s_fc73a7c9587683::t_47b90d3a249e55 31-32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9edf9e5728c387b789af10db1c8a8ed7b539056f",
+  "prompts": {},
+  "sessions": {
+    "s_e050e2bde8a246": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019e9296-4ed4-786c-96d1-b8237d516f79",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Jordan Coeyman <jcoeyman@cloudflare.com>"
+    },
+    "s_fc73a7c9587683": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019f959f-ed3f-78c4-b8f7-55e513d85ddb",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jordan Coeyman <jcoeyman@cloudflare.com>"
+    }
+  }
+}
