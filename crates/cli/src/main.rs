@@ -958,14 +958,15 @@ fn write_json_file_entry<W: Write>(file_run: &FileRun, output: &mut W) -> io::Re
             write!(output, ",")?;
         }
         write!(output, "{{\"id\":")?;
-        let occurrence_index = operator_occurrence_index(&generated, &result.mutant);
+        let tiebreak_index =
+            contextual_tiebreak_index(&generated, &file_run.source, &result.mutant);
         write_json_string(
             output,
             &stable_mutant_id(
                 &file_run.file,
                 &file_run.source,
                 &result.mutant,
-                occurrence_index,
+                tiebreak_index,
             ),
         )?;
         write!(output, ",\"line\":{},\"operator\":", result.mutant.line)?;
@@ -1010,10 +1011,10 @@ fn write_json_to<W: Write>(
             write!(output, ",")?;
         }
         write!(output, "{{\"id\":")?;
-        let occurrence_index = operator_occurrence_index(&generated, &result.mutant);
+        let tiebreak_index = contextual_tiebreak_index(&generated, source, &result.mutant);
         write_json_string(
             output,
-            &stable_mutant_id(file, source, &result.mutant, occurrence_index),
+            &stable_mutant_id(file, source, &result.mutant, tiebreak_index),
         )?;
         write!(output, ",\"line\":{},\"operator\":", result.mutant.line)?;
         write_json_string(output, result.mutant.operator.id())?;
@@ -1080,12 +1081,13 @@ fn write_multi_sarif_to<W: Write>(file_runs: &[FileRun], output: &mut W) -> io::
                 output.write_all(b",")?;
             }
             result_count += 1;
-            let occurrence_index = operator_occurrence_index(&generated, &result.mutant);
+            let tiebreak_index =
+                contextual_tiebreak_index(&generated, &file_run.source, &result.mutant);
             let mutant_id = stable_mutant_id(
                 &file_run.file,
                 &file_run.source,
                 &result.mutant,
-                occurrence_index,
+                tiebreak_index,
             );
             output.write_all(b"{\"ruleId\":")?;
             write_json_string(output, result.mutant.operator.id())?;
@@ -1140,8 +1142,8 @@ fn write_sarif_to<W: Write>(
             output.write_all(b",")?;
         }
         result_count += 1;
-        let occurrence_index = operator_occurrence_index(&generated, &result.mutant);
-        let mutant_id = stable_mutant_id(file, source, &result.mutant, occurrence_index);
+        let tiebreak_index = contextual_tiebreak_index(&generated, source, &result.mutant);
+        let mutant_id = stable_mutant_id(file, source, &result.mutant, tiebreak_index);
         output.write_all(b"{\"ruleId\":")?;
         write_json_string(output, result.mutant.operator.id())?;
         output.write_all(b",\"message\":{\"text\":\"Surviving mutant\"},\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":")?;
@@ -1234,31 +1236,117 @@ fn stable_mutant_id(
     file: &Path,
     source: &str,
     mutant: &bughunter_engine::Mutant,
-    occurrence_index: u64,
+    tiebreak_index: u64,
 ) -> String {
     let original = source
         .get(mutant.span_start as usize..mutant.span_end as usize)
         .unwrap_or_default();
-    let occurrence_index = occurrence_index.to_le_bytes();
+    let context = mutant_identity_context(source, mutant);
+    let tiebreak_index = tiebreak_index.to_le_bytes();
     let hash = stable_hash(&[
         file.to_string_lossy().as_bytes(),
         mutant.operator.id().as_bytes(),
         original.as_bytes(),
         mutant.replacement.as_bytes(),
-        &occurrence_index,
+        context.as_bytes(),
+        &tiebreak_index,
     ]);
     format!("{hash:016x}")
 }
 
-fn operator_occurrence_index(
+fn contextual_tiebreak_index(
     generated: &[bughunter_engine::Mutant],
+    source: &str,
     mutant: &bughunter_engine::Mutant,
 ) -> u64 {
-    generated
+    let context = mutant_identity_context(source, mutant);
+    let matching = generated
         .iter()
-        .filter(|candidate| candidate.operator == mutant.operator)
-        .position(|candidate| candidate == mutant)
+        .filter(|candidate| {
+            candidate.operator == mutant.operator
+                && mutant_identity_context(source, candidate) == context
+        })
+        .collect::<Vec<_>>();
+    if matching.len() == 1 {
+        return 0;
+    }
+    matching
+        .iter()
+        .position(|candidate| *candidate == mutant)
         .map_or(0, |index| index as u64 + 1)
+}
+
+fn mutant_identity_context(source: &str, mutant: &bughunter_engine::Mutant) -> String {
+    const WINDOW_CHARACTERS: usize = 96;
+
+    let span_start = mutant.span_start as usize;
+    let span_end = mutant.span_end as usize;
+    let declaration_start = enclosing_declaration_start(source, span_start);
+    let declaration_end = declaration_start
+        .and_then(|start| enclosing_declaration_end(source, start))
+        .unwrap_or(source.len());
+    let before = source
+        .get(declaration_start.unwrap_or(0)..span_start)
+        .unwrap_or_default()
+        .chars()
+        .rev()
+        .take(WINDOW_CHARACTERS)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let after = source
+        .get(span_end..declaration_end)
+        .unwrap_or_default()
+        .chars()
+        .take(WINDOW_CHARACTERS)
+        .collect::<String>();
+    format!(
+        "{}|{}|{}",
+        declaration_start
+            .map(|start| enclosing_declaration_name(source, start))
+            .unwrap_or_default(),
+        normalize_source_tokens(&before),
+        normalize_source_tokens(&after)
+    )
+}
+
+fn enclosing_declaration_start(source: &str, span_start: usize) -> Option<usize> {
+    source
+        .get(..span_start)
+        .unwrap_or_default()
+        .match_indices("function ")
+        .map(|(index, _)| index)
+        .last()
+}
+
+fn enclosing_declaration_name(source: &str, declaration_start: usize) -> &str {
+    let declaration = source
+        .get(declaration_start + "function ".len()..)
+        .unwrap_or_default();
+    let name_end = declaration
+        .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .unwrap_or(declaration.len());
+    &declaration[..name_end]
+}
+
+fn enclosing_declaration_end(source: &str, declaration_start: usize) -> Option<usize> {
+    let declaration = source.get(declaration_start..)?;
+    let body_start = declaration.find('{')?;
+    let mut depth = 0_u32;
+    for (index, character) in declaration[body_start..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' if depth == 1 => return Some(declaration_start + body_start + index),
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn normalize_source_tokens(source: &str) -> String {
+    source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn stable_hash(fields: &[&[u8]]) -> u64 {
