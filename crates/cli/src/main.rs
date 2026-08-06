@@ -42,6 +42,7 @@ REQUIRED:
   --operators <IDS>     comma-separated operator ids (see below)
   --test <CMD>          test command, run once per mutant
   --json                emit JSON on stdout
+  --sarif <PATH>        write SARIF 2.1.0 output to PATH
 
 OPTIONS:
   --line-range S-E      only mutate lines S..E inclusive, 1-based
@@ -115,6 +116,10 @@ async fn run(arguments: Vec<String>) -> Result<i32, String> {
     results.sort_by_key(|result| (result.mutant.span_start, result.mutant.operator));
     write_json(&options.file, &source, &results)
         .map_err(|error| format!("failed to write JSON: {error}"))?;
+    if let Some(path) = &options.sarif {
+        write_sarif(path, &options.file, &source, &results)
+            .map_err(|error| format!("failed to write SARIF: {error}"))?;
+    }
     Ok(exit_code_for_results(options.fail_on_survivors, &results))
 }
 
@@ -149,6 +154,7 @@ struct RunOptions {
     timeout_ms: u64,
     concurrency: usize,
     line_range: Option<LineRange>,
+    sarif: Option<PathBuf>,
     skip_baseline: bool,
     fail_on_survivors: bool,
 }
@@ -253,6 +259,7 @@ fn parse_run_arguments(arguments: Vec<String>) -> Result<RunOptions, String> {
     let mut timeout_ms = DEFAULT_TIMEOUT_MS;
     let mut concurrency = DEFAULT_CONCURRENCY;
     let mut line_range = None;
+    let mut sarif = None;
     let mut json = false;
     let mut skip_baseline = false;
     let mut fail_on_survivors = false;
@@ -287,6 +294,7 @@ fn parse_run_arguments(arguments: Vec<String>) -> Result<RunOptions, String> {
                 )?)?)
             }
             "--json" => json = true,
+            "--sarif" => sarif = Some(PathBuf::from(next_value(&mut arguments, "--sarif")?)),
             "--skip-baseline" => skip_baseline = true,
             "--fail-on-survivors" => fail_on_survivors = true,
             _ => return Err(format!("unknown argument {argument}")),
@@ -312,6 +320,7 @@ fn parse_run_arguments(arguments: Vec<String>) -> Result<RunOptions, String> {
         timeout_ms,
         concurrency,
         line_range,
+        sarif,
         skip_baseline,
         fail_on_survivors,
     })
@@ -461,6 +470,75 @@ fn write_json_to<W: Write>(
     writeln!(output, "]}}")
 }
 
+fn write_sarif(path: &Path, file: &Path, source: &str, results: &[MutantResult]) -> io::Result<()> {
+    let mut output = fs::File::create(path)?;
+    write_sarif_to(file, source, results, &mut output)
+}
+
+fn write_sarif_to<W: Write>(
+    file: &Path,
+    source: &str,
+    results: &[MutantResult],
+    output: &mut W,
+) -> io::Result<()> {
+    let generated =
+        try_mutants(source, &file.to_string_lossy(), &Operator::ALL).unwrap_or_default();
+    let operators = surviving_operators(results);
+
+    output.write_all(b"{\"$schema\":")?;
+    write_json_string(output, "https://json.schemastore.org/sarif-2.1.0.json")?;
+    output.write_all(
+        b",\"version\":\"2.1.0\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"bughunter\",\"informationUri\":\"https://github.com/acoyfellow/bughunter\",\"semanticVersion\":",
+    )?;
+    write_json_string(output, env!("CARGO_PKG_VERSION"))?;
+    output.write_all(b",\"rules\":[")?;
+    for (index, operator) in operators.iter().enumerate() {
+        if index > 0 {
+            output.write_all(b",")?;
+        }
+        output.write_all(b"{\"id\":")?;
+        write_json_string(output, operator.id())?;
+        output.write_all(b"}")?;
+    }
+    output.write_all(b"]}},\"results\":[")?;
+    let mut result_count = 0;
+    for result in results {
+        if result.status != MutantStatus::Survived {
+            continue;
+        }
+        if result_count > 0 {
+            output.write_all(b",")?;
+        }
+        result_count += 1;
+        let occurrence_index = operator_occurrence_index(&generated, &result.mutant);
+        let mutant_id = stable_mutant_id(file, source, &result.mutant, occurrence_index);
+        output.write_all(b"{\"ruleId\":")?;
+        write_json_string(output, result.mutant.operator.id())?;
+        output.write_all(b",\"message\":{\"text\":\"Surviving mutant\"},\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":")?;
+        write_json_string(output, &file.to_string_lossy())?;
+        output.write_all(b"},\"region\":")?;
+        write!(
+            output,
+            "{{\"startLine\":{},\"startColumn\":{}}}",
+            result.mutant.line, result.mutant.column
+        )?;
+        output.write_all(b"}}],\"partialFingerprints\":{\"bughunterMutantId/v1\":")?;
+        write_json_string(output, &mutant_id)?;
+        output.write_all(b"}}")?;
+    }
+    output.write_all(b"]}]}")
+}
+
+fn surviving_operators(results: &[MutantResult]) -> Vec<Operator> {
+    let mut operators = Vec::new();
+    for result in results {
+        if result.status == MutantStatus::Survived && !operators.contains(&result.mutant.operator) {
+            operators.push(result.mutant.operator);
+        }
+    }
+    operators
+}
+
 #[derive(Debug, PartialEq)]
 struct ResultSummary {
     total: usize,
@@ -589,8 +667,8 @@ fn status_id(status: MutantStatus) -> &'static str {
 mod tests {
     use super::{
         exit_code_for_results, parse_line_range, parse_run_arguments, select_line_range,
-        stable_mutant_id, verify_baseline, version_output, write_json_to, LineRange, ResultSummary,
-        RunOptions,
+        stable_mutant_id, verify_baseline, version_output, write_json_to, write_sarif_to,
+        LineRange, ResultSummary, RunOptions,
     };
     use bughunter_engine::{mutants, Mutant, Operator};
     use bughunter_runner::{MutantResult, MutantStatus};
@@ -771,6 +849,110 @@ mod tests {
     }
 
     #[test]
+    fn sarif_serialization_emits_one_result_for_a_surviving_mutant() {
+        let source = "const ready = left && right;\n";
+        let mutant = mutants(source, "src/ready.ts", &[Operator::LogicalAndToOr]).remove(0);
+        let results = [MutantResult {
+            mutant,
+            status: MutantStatus::Survived,
+            detail: None,
+        }];
+        let mut output = Vec::new();
+
+        write_sarif_to(Path::new("src/ready.ts"), source, &results, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("\"partialFingerprints\":").count(), 1);
+        assert!(output.contains("\"ruleId\":\"logical-and-to-or\""));
+        assert!(output.contains("\"bughunterMutantId/v1\":\""));
+    }
+
+    #[test]
+    fn sarif_serialization_omits_killed_mutants() {
+        let source = "const ready = left && right;\n";
+        let mutant = mutants(source, "src/ready.ts", &[Operator::LogicalAndToOr]).remove(0);
+        let results = [MutantResult {
+            mutant,
+            status: MutantStatus::Killed,
+            detail: None,
+        }];
+        let mut output = Vec::new();
+
+        write_sarif_to(Path::new("src/ready.ts"), source, &results, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\"version\":\"2.1.0\""));
+        assert!(output.contains("\"$schema\":\""));
+        assert!(output.contains("\"rules\":[]"));
+        assert!(output.contains("\"results\":[]"));
+    }
+
+    #[test]
+    fn same_operator_survivors_have_distinct_sarif_fingerprints() {
+        let source = "const first = left && right;\nconst second = top && bottom;\n";
+        let results = mutants(source, "src/ready.ts", &[Operator::LogicalAndToOr])
+            .into_iter()
+            .map(|mutant| MutantResult {
+                mutant,
+                status: MutantStatus::Survived,
+                detail: None,
+            })
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+
+        write_sarif_to(Path::new("src/ready.ts"), source, &results, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        let fingerprints = output
+            .split("\"bughunterMutantId/v1\":\"")
+            .skip(1)
+            .map(|entry| entry.split('\"').next().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(fingerprints.len(), 2);
+        assert_ne!(fingerprints[0], fingerprints[1]);
+    }
+
+    #[test]
+    fn sarif_artifact_uris_are_relative() {
+        let source = "const ready = left && right;\n";
+        let mutant = mutants(source, "src/ready.ts", &[Operator::LogicalAndToOr]).remove(0);
+        let results = [MutantResult {
+            mutant,
+            status: MutantStatus::Survived,
+            detail: None,
+        }];
+        let mut output = Vec::new();
+
+        write_sarif_to(Path::new("src/ready.ts"), source, &results, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\"uri\":\"src/ready.ts\""));
+        assert!(!output.contains("\"uri\":\"/"));
+        assert!(!output.contains("Users"));
+    }
+
+    #[test]
+    fn sarif_and_json_options_compose() {
+        let result = parse_run_arguments(vec![
+            "run".to_owned(),
+            "--repo".to_owned(),
+            "fixture".to_owned(),
+            "--file".to_owned(),
+            "source.ts".to_owned(),
+            "--operators".to_owned(),
+            "logical-and-to-or".to_owned(),
+            "--test".to_owned(),
+            "true".to_owned(),
+            "--json".to_owned(),
+            "--sarif".to_owned(),
+            "results.sarif".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(result.sarif, Some(PathBuf::from("results.sarif")));
+    }
+
+    #[test]
     fn same_operator_mutants_have_distinct_json_ids() {
         let source = "const first = left === right;\nconst second = top === bottom;\n";
         let results = mutants(
@@ -929,6 +1111,7 @@ mod tests {
             timeout_ms: 1_500,
             concurrency: 1,
             line_range: None,
+            sarif: None,
             skip_baseline: false,
             fail_on_survivors: false,
         };

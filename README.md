@@ -78,12 +78,19 @@ bughunter run --repo <DIR> --file <RELATIVE.ts> --operators <IDS> --test <CMD> -
 | `--operators <IDS>` | comma-separated operator ids; an unknown id is a hard error |
 | `--test <CMD>` | test command, run once per mutant |
 | `--json` | emit JSON on stdout |
+| `--sarif <PATH>` | write a SARIF 2.1.0 log to a path |
 | `--line-range S-E` | only mutate lines S..E inclusive, 1-based |
 | `--timeout-ms N` | per-mutant timeout, default 30000 |
 | `--concurrency N` | mutants in flight, default 4 |
 | `--skip-baseline` | do not verify the suite passes before mutating |
 | `--fail-on-survivors` | gate CI: exit 2 on survivors, exit 3 on unevaluated mutants |
 | `--version` | print the installed bughunter version |
+
+`--sarif` can be combined with `--json`.
+
+The JSON payload remains on stdout.
+
+The SARIF log contains one result for each surviving mutant.
 
 ### Exit codes
 
