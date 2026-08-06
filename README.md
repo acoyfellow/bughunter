@@ -159,17 +159,26 @@ bughunter never counts `timeout` or `error` as `killed`. A hung suite is an unkn
 
 ## Trust boundary
 
-`--test` is trusted input. bughunter is not a security sandbox.
+`--test` is trusted input. bughunter is not a security sandbox. It runs your `--test` command with `sh -c`.
+That command can do anything your shell can do.
+
 The baseline check runs before materialization, with its working directory set directly to the real `--repo`.
 For each mutant, bughunter canonicalizes and validates the source path is under `--repo`, then recursively
 copies the repository without `.git` into a mode-`0700` directory under
-`$TMPDIR/bh-work/runner-materializations/<pid>-<time>-<sequence>` and writes the mutated source only there.
-Per-mutant `sh -c` commands run in that temporary copy, which is removed afterward.
+`$TMPDIR/bh-work/runner-materializations/<pid>-<time>-<sequence>`, preserving original file permissions,
+and writes the mutated source only there. The per-mutant repository copy holds your secrets in cleartext,
+including `.env`, `.dev.vars`, credentials, and tokens. Per-mutant `sh -c` commands run in that temporary
+copy, which is removed afterward.
+
+bughunter creates each run directory fresh with mode `0700` and refuses to reuse an existing directory.
+This behavior matters on a shared host. Another user can create a predictable path first. That user then
+receives your secrets in cleartext.
+
 However, `node_modules` regular files and dependency directories are symlinked to their originals, so a
-per-mutant test can write through those links to real dependencies.
-A test command can also name an absolute path and write anywhere the invoking user can access.
-Process-group handling limits timeout orphans; it does not limit filesystem access.
-Do not point bughunter at a repository whose test command or dependencies you do not trust.
+per-mutant test can write through those links to real dependencies. A test command can also name an absolute
+path and write anywhere the invoking user can access. Process-group handling limits timeout orphans; it does
+not limit filesystem access. Do not point bughunter at a repository whose test command or dependencies you
+do not trust.
 
 ## How it works
 
