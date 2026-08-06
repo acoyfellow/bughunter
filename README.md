@@ -12,7 +12,7 @@ your tests execute but do not check. Line coverage cannot tell those apart. This
 $ bughunter run --repo ./my-app --file src/auth.ts \
     --operators logical-and-to-or,equality-strict-to-loose-neg \
     --test 'npx vitest run' --json
-{"schema_version":1,"total":12,"killed":8,"survived":4,"timeout":0,"error":0,"evaluated":12,"score":0.6666666666666666,"mutants":[{"id":"a1b2c3d4e5f60708","line":31,"operator":"logical-and-to-or","status":"survived"}, ...]}
+{"schema_version":2,"total":12,"killed":8,"survived":4,"timeout":0,"error":0,"evaluated":12,"score":0.6666666666666666,"mutants":[{"id":"a1b2c3d4e5f60708","line":31,"operator":"logical-and-to-or","status":"survived"}, ...]}
 ```
 
 ## What it found
@@ -197,8 +197,8 @@ mutant and passes against clean source**; a test that passes both ways proves no
 
 ### JSON schema and score
 
-Every payload starts with `"schema_version": 1`, so consumers can reject an unknown format instead
-of guessing how to parse it. The payload provides these top-level fields:
+Every payload starts with `"schema_version": 2`. Consumers can reject an unknown format instead of
+guessing how to parse it. The payload provides these top-level fields:
 
 | field | meaning |
 |---|---|
@@ -208,12 +208,13 @@ of guessing how to parse it. The payload provides these top-level fields:
 | `score` | `killed / evaluated`, or `null` when `evaluated` is zero |
 | `mutants` | individual findings, each with its current `line`, operator, status, and stable `id` |
 
-A mutant `id` is a fixed-width lowercase FNV-1a hash. It covers four things: the relative file path,
-the operator name, the original text of the mutated span, and the replacement text.
+Each mutant `id` is unique within a payload. It is a fixed-width lowercase FNV-1a hash.
 
-The hash deliberately excludes line numbers, byte offsets, and absolute paths. Add unrelated lines
-above a mutation and the human-facing `line` changes, but the machine-facing `id` does not. You can
-therefore diff two runs across commits.
+The hash covers the relative file path, operator name, original span text, replacement text, and
+operator occurrence index. The index counts that operator's mutations in source order.
+
+The hash excludes line numbers, byte offsets, and absolute paths. Add unrelated lines above a
+mutation and its `line` changes, but its `id` does not. IDs stay stable across line shifts.
 
 ```
 evaluated = killed + survived
