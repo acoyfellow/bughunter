@@ -1,5 +1,7 @@
 # bughunter
 
+[![CI](https://github.com/acoyfellow/bughunter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/acoyfellow/bughunter/actions/workflows/ci.yml)
+
 ![bughunter](docs/social-card.jpg)
 
 A mutation-testing CLI for TypeScript. It changes one operator in your source, runs your real test
@@ -15,23 +17,60 @@ $ bughunter run --repo ./my-app --file src/auth.ts \
 {"schema_version":2,"total":12,"killed":8,"survived":4,"timeout":0,"error":0,"evaluated":12,"score":0.6666666666666666,"mutants":[{"id":"a1b2c3d4e5f60708","line":31,"operator":"logical-and-to-or","status":"survived"}, ...]}
 ```
 
+## Try it in 30 seconds
+
+`examples/access-check` is a self-contained fixture: an access-control module and a 12-test suite
+that passes. It has **no dependencies and no `node_modules`**. It uses Node's built-in test runner
+and native TypeScript support, so it needs only Node 22.6+ and no install step.
+
+From a clean clone, copy and paste:
+
+```sh
+git clone https://github.com/acoyfellow/bughunter.git
+cd bughunter
+cargo build --quiet
+./target/debug/bughunter run \
+  --repo examples/access-check --file src/access.ts \
+  --operators cond-boundary-gt,cond-boundary-lt,logical-and-to-or,logical-or-to-and,equality-strict-to-loose-neg,inequality-to-equality,return-true-to-false,return-false-to-true \
+  --test 'node --experimental-strip-types --test src/access.test.ts' --json 2>/dev/null
+```
+
+The command above was run from a clean clone. Its stdout is exactly:
+
+```
+{"schema_version":2,"total":16,"killed":13,"survived":3,"timeout":0,"error":0,"evaluated":16,"score":0.8125,"mutants":[{"id":"743dbc7b02b2e14b","line":9,"operator":"equality-strict-to-loose-neg","status":"killed"},{"id":"776154ac39c54f3b","line":9,"operator":"return-true-to-false","status":"killed"},{"id":"b9455bf0af1cb416","line":10,"operator":"equality-strict-to-loose-neg","status":"killed"},{"id":"e1b6ab9d5b2347d4","line":10,"operator":"return-true-to-false","status":"survived"},{"id":"448fa0b79c347a84","line":11,"operator":"return-false-to-true","status":"killed"},{"id":"6c3e58b7362b04f3","line":15,"operator":"equality-strict-to-loose-neg","status":"killed"},{"id":"83022e0a18aef21a","line":15,"operator":"return-false-to-true","status":"survived"},{"id":"ce3a7b4b5e021db4","line":16,"operator":"inequality-to-equality","status":"killed"},{"id":"437038af8fb15693","line":16,"operator":"logical-and-to-or","status":"killed"},{"id":"91a9765cd1275d3b","line":16,"operator":"equality-strict-to-loose-neg","status":"killed"},{"id":"80e2ba434670fb4e","line":20,"operator":"equality-strict-to-loose-neg","status":"killed"},{"id":"025c8e871465b640","line":20,"operator":"logical-or-to-and","status":"killed"},{"id":"88743788a84eac94","line":20,"operator":"equality-strict-to-loose-neg","status":"killed"},{"id":"6ba38fa5f8eaa275","line":24,"operator":"inequality-to-equality","status":"killed"},{"id":"a1356b4c2b97fe68","line":28,"operator":"cond-boundary-lt","status":"survived"},{"id":"bbb64bcb85bb4342","line":39,"operator":"logical-and-to-or","status":"killed"}]}
+```
+
+16 mutants, 13 killed, 3 survived:
+
+| line | operator | what it means |
+|---|---|---|
+| 10 | `return-true-to-false` | `isPublicPath("/version")` is never tested. `/health` is. |
+| 15 | `return-false-to-true` | the `expected === null` early return is never exercised. |
+| 28 | `cond-boundary-lt` | `withinQuota` has an untested boundary. |
+
+That third one is a real off-by-one. Change `used < limit` to `used <= limit` and every test still
+passes, but the quota now permits going one over. Verify by hand:
+
+```
+cd examples/access-check
+sed -i '' 's/used < limit/used <= limit/' src/access.ts
+node --experimental-strip-types --test src/access.test.ts   # 12 pass, 0 fail
+git checkout src/access.ts
+```
+
+12 tests, 100% line coverage of that function, and a boundary bug walks straight through. That gap
+is what this tool is for.
+
+The clean clone output above is the checkable evidence for the tool.
+
 ## What it found
 
-The reproducible demo is in [Try it in 30 seconds](#try-it-in-30-seconds) below. This section is
-the wider evidence: five unrelated private repositories, one real source file each, all eight
-operators, each project's own vitest suite. You cannot re-run these, so treat the table as a report
-rather than a proof — but the two hand-verified survivors below are quoted in full so you can judge
-the reasoning.
-
-| repo | file | mutants | killed | survived | timeout | error | score |
-|---|---|---:|---:|---:|---:|---:|---:|
-| backwards | `src/engine.ts` | 21 | 16 | 5 | 0 | 0 | 76% |
-| diffgate | `src/matcher.ts` | 26 | 18 | 8 | 0 | 0 | 69% |
-| summon | `src/lib/oauth.ts` | 29 | 11 | 18 | 0 | 0 | 37% |
-| up | `src/capabilities.ts` | 48 | 23 | 25 | 0 | 0 | 47% |
-| vitest-visual-diff | `src/style.ts` | 16 | 7 | 9 | 0 | 0 | 43% |
-
-140 mutants, zero timeouts, zero errors. Every suite was green before mutating.
+> **Non-reproducible private-repository report.** The following evidence comes from five unrelated
+> private repositories, one real source file each, all eight operators, and each project's own
+> vitest suite. You cannot clone or re-run those repositories, so the table is a report rather than
+> proof. The two hand-verified survivor diffs below are quoted in full so you can judge the reasoning
+> independently.
 
 Two survivors were then reproduced by hand, without the tool, to confirm they are real:
 
@@ -53,6 +92,18 @@ All 35 tests still pass. The loop's termination condition is untested.
 
 All 18 tests still pass. The predicate now accepts any non-null value, including strings and
 numbers, and nothing notices.
+
+The broader non-reproducible report follows:
+
+| repo | file | mutants | killed | survived | timeout | error | score |
+|---|---|---:|---:|---:|---:|---:|---:|
+| backwards | `src/engine.ts` | 21 | 16 | 5 | 0 | 0 | 76% |
+| diffgate | `src/matcher.ts` | 26 | 18 | 8 | 0 | 0 | 69% |
+| summon | `src/lib/oauth.ts` | 29 | 11 | 18 | 0 | 0 | 37% |
+| up | `src/capabilities.ts` | 48 | 23 | 25 | 0 | 0 | 47% |
+| vitest-visual-diff | `src/style.ts` | 16 | 7 | 9 | 0 | 0 | 43% |
+
+140 mutants, zero timeouts, zero errors. Every suite was green before mutating.
 
 ## Install
 
@@ -244,12 +295,15 @@ guessing how to parse it. The payload provides these top-level fields:
 Each mutant `id` is unique within a payload. It is a fixed-width lowercase FNV-1a hash.
 
 The hash covers the relative file path, operator name, original span text, replacement text, and
-operator occurrence index. The index counts that operator's mutations in source order.
+stable source context that distinguishes same-operator mutations.
 
 The hash excludes line numbers, byte offsets, and absolute paths. Add unrelated lines above a
 mutation and its `line` changes, but its `id` does not. IDs stay stable across line shifts.
 
-Adding or removing an earlier mutation of the same operator renumbers later IDs in that file.
+Inserting a new occurrence of the same operator earlier in a file leaves every pre-existing mutant
+ID byte-identical, and the newly inserted mutant receives a fresh unused ID.
+[`scripts/gate-id-stability.sh`](scripts/gate-id-stability.sh) proves this property, and CI runs it
+on every push.
 
 ```
 evaluated = killed + survived
@@ -305,38 +359,3 @@ cargo test --workspace
 
 46 tests: 21 CLI, 15 engine, 10 runner. The runner tests cover killed, survived, timeout,
 process-group orphan reaping, the `node_modules` symlink, and the concurrency bound.
-
-## Try it in 30 seconds
-
-`examples/access-check` is a self-contained fixture: an access-control module and a 12-test suite
-that passes. It has **no dependencies and no `node_modules`**. It uses Node's built-in test runner
-and native TypeScript support, so it needs only Node 22.6+ and no install step.
-
-```
-cargo build
-./target/debug/bughunter run \
-  --repo examples/access-check --file src/access.ts \
-  --operators cond-boundary-gt,cond-boundary-lt,logical-and-to-or,logical-or-to-and,equality-strict-to-loose-neg,inequality-to-equality,return-true-to-false,return-false-to-true \
-  --test 'node --experimental-strip-types --test src/access.test.ts' --json
-```
-
-16 mutants, 13 killed, 3 survived:
-
-| line | operator | what it means |
-|---|---|---|
-| 10 | `return-true-to-false` | `isPublicPath("/version")` is never tested. `/health` is. |
-| 15 | `return-false-to-true` | the `expected === null` early return is never exercised. |
-| 28 | `cond-boundary-lt` | `withinQuota` has an untested boundary. |
-
-That third one is a real off-by-one. Change `used < limit` to `used <= limit` and every test still
-passes, but the quota now permits going one over. Verify by hand:
-
-```
-cd examples/access-check
-sed -i '' 's/used < limit/used <= limit/' src/access.ts
-node --experimental-strip-types --test src/access.test.ts   # 12 pass, 0 fail
-git checkout src/access.ts
-```
-
-12 tests, 100% line coverage of that function, and a boundary bug walks straight through. That gap
-is what this tool is for.

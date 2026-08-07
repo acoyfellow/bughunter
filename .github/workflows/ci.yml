@@ -2,7 +2,6 @@ name: ci
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
@@ -20,6 +19,18 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: scripts/gate.sh
+        run: ./scripts/gate.sh
+      - name: scripts/gate-sarif.sh
+        run: ./scripts/gate-sarif.sh
+      - name: scripts/gate-unique-ids.sh
+        run: ./scripts/gate-unique-ids.sh
+      - name: scripts/gate-crawl.sh
+        run: ./scripts/gate-crawl.sh
+      - name: scripts/gate-config.sh
+        run: ./scripts/gate-config.sh
+      - name: scripts/gate-id-stability.sh
+        run: ./scripts/gate-id-stability.sh
       - name: example fixture baseline passes
         working-directory: examples/access-check
         run: node --experimental-strip-types --test src/access.test.ts
